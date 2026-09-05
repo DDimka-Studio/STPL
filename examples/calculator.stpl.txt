@@ -1,0 +1,49 @@
+!export display*
+!export input*
+!export logic*
+!export math*
+!export exit*
+
+start main
+
+main() {
+    display.show.text("Enter first number:")
+    float num1 = 0
+    input.read.number() > num1
+
+    display.show.text("Select operation (1: +, 2: -, 3: *, 4: /):")
+    float op = 0
+    input.read.number() > op
+
+    display.show.text("Enter second number:")
+    float num2 = 0
+    input.read.number() > num2
+
+    float result = 0
+
+    if op == 1 {
+        math.count.equation(num1 + num2) > result
+    };
+    if op == 2 {
+        math.count.equation(num1 - num2) > result
+    };
+    if op == 3 {
+        math.count.equation(num1 * num2) > result
+    };
+    if op == 4 {
+        math.count.equation(num1 / num2) > result
+    };
+
+    display.show.text(result)
+    display.show.text("Done!")
+
+    exit num1
+    exit num2
+    exit op
+    exit result
+    exit display
+    exit input
+    exit logic
+    exit math
+    exit exit
+};

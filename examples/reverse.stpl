@@ -1,0 +1,34 @@
+!export display*
+!export str*
+!export math*
+!export exit*
+
+start main
+
+main() {
+    int(char=64) text = "recursion"
+    float len = 0
+    str.length(text) > len
+
+    int(char=64) result = ""
+    float i = 0
+    loop repeat len {
+        float pos = 0
+        math.count.equation(len - 1 - i) > pos
+        int(char=8) ch = ""
+        str.char_at(text, pos) > ch
+        str.concat(result, ch) > result
+        math.count.equation(i + 1) > i
+    };
+    display.show.text(result)
+
+    exit display
+    exit str
+    exit math
+    exit text
+    exit len
+    exit result
+    exit i
+    exit exit
+    return 0
+};

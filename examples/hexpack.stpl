@@ -1,0 +1,42 @@
+!export display*
+!export map*
+!export math*
+!export logic*
+!export exit*
+
+start main
+
+main() {
+    map.set("hexval", "0", 0)
+    map.set("hexval", "5", 5)
+    map.set("hexval", "A", 10)
+    map.set("hexval", "F", 15)
+
+    float hi = 0
+    float lo = 0
+    map.get("hexval", "A") > hi
+    map.get("hexval", "5") > lo
+
+    float packed = 0
+    math.count.equation((hi << 4) | lo) > packed
+    display.show.text(packed)
+
+    float unpacked_hi = 0
+    float unpacked_lo = 0
+    math.count.equation(packed >> 4) > unpacked_hi
+    math.count.equation(packed & 15) > unpacked_lo
+    display.show.text(unpacked_hi)
+    display.show.text(unpacked_lo)
+
+    exit display
+    exit map
+    exit math
+    exit logic
+    exit hi
+    exit lo
+    exit packed
+    exit unpacked_hi
+    exit unpacked_lo
+    exit exit
+    return 0
+};

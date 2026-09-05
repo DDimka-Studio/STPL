@@ -1,0 +1,20 @@
+!export display*
+!export photo.png
+!export logic*
+!export exit*
+start main
+main() {
+ if TERM != kitty, kitty-xterm{
+exit logic
+exit exit
+return 1
+};
+ else {
+  display.show.image(photo.png)
+exit display
+exit logic
+exit photo.png
+exit exit
+return 0
+ };
+};

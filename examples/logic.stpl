@@ -1,0 +1,30 @@
+!export display*
+!export logic*
+!export math*
+!export exit*
+start logic
+logic() {
+float result=0
+math.count.equation(10+35)>result
+ if result <= 22.5 {
+  start print
+};
+ else {
+  exit logic
+  exit math
+  exit exit
+  return 1
+ };
+};
+
+print() {
+ loop repeat 10{
+display.show.text(result)
+};
+exit display
+exit result
+exit logic
+exit math
+exit exit
+return 0
+};

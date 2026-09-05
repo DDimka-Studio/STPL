@@ -1,0 +1,36 @@
+!export display*
+!export logic*
+!export math*
+!export exit*
+
+start main
+
+fib(float n) {
+    if n <= 1 {
+        return n
+    };
+    float n1 = 0
+    float n2 = 0
+    math.count.equation(n - 1) > n1
+    math.count.equation(n - 2) > n2
+    float a = 0
+    float b = 0
+    fib(n1) > a
+    fib(n2) > b
+    float result = 0
+    math.count.equation(a + b) > result
+    return result
+};
+
+main() {
+    float r = 0
+    fib(10) > r
+    display.show.text(r)
+
+    exit display
+    exit logic
+    exit math
+    exit r
+    exit exit
+    return 0
+};

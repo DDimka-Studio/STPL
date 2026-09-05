@@ -1,0 +1,65 @@
+!export display*
+!export sync*
+!export map*
+!export math*
+!export logic*
+!export sleep*
+!export exit*
+
+start worker1
+start worker2
+
+worker1() {
+    float counter = 0
+    loop repeat 200000 {
+        sync.lock("counter")
+        math.count.equation(counter + 1) > counter
+        sync.unlock("counter")
+    };
+
+    sync.lock("flags")
+    map.set("flags", "w1_done", 1)
+    sync.unlock("flags")
+
+    // Пока в языке нет primitива "дождаться завершения всех
+    // start-задач" (main() при нескольких top-level start ничего не
+    // делает после pthread_join — эпилога у пользователя нет), поэтому
+    // "join" собран прямо на STPL из уже существующих кирпичиков:
+    // map как флаг готовности, sync — защитить доступ к флагу, sleep +
+    // loop/break — ограниченный опрос вместо честного blocking-wait.
+    loop repeat 10000 {
+        float w2_done = 0
+        sync.lock("flags")
+        map.has("flags", "w2_done") > w2_done
+        sync.unlock("flags")
+        if w2_done == 1 {
+            break
+        };
+        sleep.ms(2)
+    };
+
+    display.show.text(counter)
+
+    exit display
+    exit sync
+    exit map
+    exit math
+    exit logic
+    exit sleep
+    exit counter
+    exit exit
+    return 0
+};
+
+worker2() {
+    loop repeat 200000 {
+        sync.lock("counter")
+        math.count.equation(counter + 1) > counter
+        sync.unlock("counter")
+    };
+
+    sync.lock("flags")
+    map.set("flags", "w2_done", 1)
+    sync.unlock("flags")
+    return 0
+};
