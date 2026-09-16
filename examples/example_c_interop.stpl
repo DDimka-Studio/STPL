@@ -1,0 +1,24 @@
+!export display*
+
+!c {
+    #include <math.h>
+    Value c_hypot(Value a, Value b) {
+        return rt_v_num(hypot(a.num, b.num));
+    }
+    Value c_greet(Value name) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "hello, %s!", name.str ? name.str : "(nil)");
+        return rt_v_str(buf);
+    }
+};
+
+!c c_hypot(2);
+!c c_greet(1);
+
+start main
+
+main() {
+    display.show.text(c_hypot(3, 4))
+    display.show.text(c_greet("stpl"))
+    return 0
+};
