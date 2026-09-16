@@ -43,6 +43,7 @@ typedef enum {
     TK_EXPORT_DIRECTIVE,
     TK_START, TK_IF, TK_ELSE, TK_LOOP, TK_REPEAT, TK_EXIT, TK_RETURN,
     TK_BREAK, TK_CONTINUE, TK_DCOLON,
+    TK_C_BLOCK, TK_C_DIRECTIVE,
     TK_CPU, TK_CHAR, TK_FLOAT, TK_INT8, TK_INT,
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE, TK_COMMA, TK_DOT, TK_SEMI, TK_STAR,
     TK_PLUS, TK_MINUS, TK_DIV,
@@ -140,6 +141,70 @@ static TokList lex(const char *src) {
         if (c == '!') {
             if (i+1 < n && src[i+1] == '=') { Tok t = {TK_NEQ, NULL, 0, line}; tok_push(&tl, t); i += 2; continue; }
             if (i+7 <= n && strncmp(src+i+1, "export", 6) == 0) { Tok t = {TK_EXPORT_DIRECTIVE, NULL, 0, line}; tok_push(&tl, t); i += 7; continue; }
+            /* !c — inline raw C. Two forms:
+             *   !c { <raw C code> }        — copied byte-for-byte into the generated
+             *                                 .c file (right after the includes), so
+             *                                 it can define helper types/functions.
+             *   !c name(N);                 — declares that C function `name`, already
+             *                                 defined in some `!c { }` block above,
+             *                                 takes exactly N `Value` arguments and
+             *                                 returns a `Value` (same ABI as every
+             *                                 STPL-defined function) — this makes it
+             *                                 callable from STPL as name(a, b, ...).
+             * The `{ ... }` form is scanned here, character-by-character, rather than
+             * through the normal STPL tokenizer: the body is arbitrary C, and trying
+             * to re-tokenize C as STPL would break on C string/char literals and
+             * comments that don't follow STPL's own lexical rules. We track string
+             * literals, char literals, and both comment styles ourselves purely so
+             * that a '{' or '}' *inside* one of those doesn't miscount brace depth —
+             * we do not otherwise interpret the C at all. */
+            if (i+2 <= n && src[i+1] == 'c' && !(i+2 < n && (isalnum((unsigned char)src[i+2]) || src[i+2] == '_'))) {
+                size_t j = i + 2;
+                while (j < n && isspace((unsigned char)src[j])) { if (src[j] == '\n') line++; j++; }
+                if (j < n && src[j] == '{') {
+                    int block_start_line = line;
+                    size_t start = j + 1, k = start;
+                    int depth = 1;
+                    while (k < n && depth > 0) {
+                        char cc = src[k];
+                        if (cc == '\n') { line++; k++; continue; }
+                        if (cc == '"') {
+                            k++;
+                            while (k < n && src[k] != '"') { if (src[k] == '\\' && k+1 < n) k++; if (k < n && src[k] == '\n') line++; k++; }
+                            if (k < n) k++;
+                            continue;
+                        }
+                        if (cc == '\'') {
+                            k++;
+                            while (k < n && src[k] != '\'') { if (src[k] == '\\' && k+1 < n) k++; k++; }
+                            if (k < n) k++;
+                            continue;
+                        }
+                        if (cc == '/' && k+1 < n && src[k+1] == '/') { while (k < n && src[k] != '\n') k++; continue; }
+                        if (cc == '/' && k+1 < n && src[k+1] == '*') {
+                            k += 2;
+                            while (k+1 < n && !(src[k] == '*' && src[k+1] == '/')) { if (src[k] == '\n') line++; k++; }
+                            k = (k+1 < n) ? k+2 : n;
+                            continue;
+                        }
+                        if (cc == '{') depth++;
+                        else if (cc == '}') { depth--; if (depth == 0) break; }
+                        k++;
+                    }
+                    if (depth != 0) {
+                        fprintf(stderr, "STPL: unterminated '!c { ... }' block starting at line %d\n", block_start_line);
+                        exit(1);
+                    }
+                    Tok t = {TK_C_BLOCK, dupn(src + start, k - start), 0, block_start_line};
+                    tok_push(&tl, t);
+                    i = k + 1; /* skip past the matching '}' */
+                    continue;
+                }
+                Tok t = {TK_C_DIRECTIVE, NULL, 0, line};
+                tok_push(&tl, t);
+                i += 2;
+                continue;
+            }
             fprintf(stderr, "STPL: unexpected '!' at line %d\n", line); exit(1);
         }
 
@@ -242,6 +307,30 @@ typedef struct { char **items; size_t count, cap; } StrList;
 static void str_push(StrList *sl, char *s) {
     if (sl->count == sl->cap) { sl->cap = sl->cap ? sl->cap*2 : 8; sl->items = realloc(sl->items, sl->cap*sizeof(char*)); }
     sl->items[sl->count++] = s;
+}
+
+/* !c { ... } raw blocks — kept in source order and emitted verbatim into the
+ * generated .c file, right after the #include lines. */
+typedef struct { char *text; int line; } CBlock;
+typedef struct { CBlock *items; size_t count, cap; } CBlockList;
+static void cblock_push(CBlockList *cl, CBlock b) {
+    if (cl->count == cl->cap) { cl->cap = cl->cap ? cl->cap*2 : 8; cl->items = realloc(cl->items, cl->cap*sizeof(CBlock)); }
+    cl->items[cl->count++] = b;
+}
+
+/* !c name(N); — declares an external C function (defined in some !c { }
+ * block) that STPL code may call directly as name(a, b, ...). Same ABI as
+ * an STPL-defined function: N `Value` parameters in, one `Value` out. */
+typedef struct { char *name; size_t arity; int line; } CFuncDecl;
+typedef struct { CFuncDecl *items; size_t count, cap; } CFuncList;
+static void cfunc_push(CFuncList *cl, CFuncDecl d) {
+    if (cl->count == cl->cap) { cl->cap = cl->cap ? cl->cap*2 : 8; cl->items = realloc(cl->items, cl->cap*sizeof(CFuncDecl)); }
+    cl->items[cl->count++] = d;
+}
+static CFuncDecl *find_cfunc(CFuncList *cl, const char *name) {
+    for (size_t i = 0; i < cl->count; i++)
+        if (strcmp(cl->items[i].name, name) == 0) return &cl->items[i];
+    return NULL;
 }
 
 /* ============================== Парсер ============================== */
@@ -573,6 +662,8 @@ typedef struct {
     ExportList exports;
     StrList top_starts;
     FuncList funcs;
+    CBlockList c_blocks;
+    CFuncList c_funcs;
 } Program;
 
 static void compile_error(int line, const char *fmt, ...) __attribute__((noreturn));
@@ -581,7 +672,31 @@ static Program parse_program(TokList *tl) {
     Parser p = {tl, 0};
     Program prog = {0};
 
-    while (pcheck(&p, TK_EXPORT_DIRECTIVE)) {
+    while (pcheck(&p, TK_EXPORT_DIRECTIVE) || pcheck(&p, TK_C_BLOCK) || pcheck(&p, TK_C_DIRECTIVE)) {
+        if (pcheck(&p, TK_C_BLOCK)) {
+            Tok *t = padv(&p);
+            CBlock b = { strdup(t->text), t->line };
+            cblock_push(&prog.c_blocks, b);
+            pexpect(&p, TK_SEMI, "';' after '!c { ... }' (same convention as any other '{ ... }' block)");
+            continue;
+        }
+        if (pcheck(&p, TK_C_DIRECTIVE)) {
+            int line = pcur(&p)->line;
+            padv(&p);
+            char *name = pexpect_name(&p, "an external C function name");
+            pexpect(&p, TK_LPAREN, "'(' (e.g. !c my_func(2);)");
+            Tok *num = pcur(&p); pexpect(&p, TK_NUM, "the number of Value arguments the C function takes");
+            if (num->num < 0 || num->num != (double)(long)num->num)
+                compile_error(line, "'!c %s(...)': argument count must be a non-negative whole number", name);
+            pexpect(&p, TK_RPAREN, "')'");
+            pexpect(&p, TK_SEMI, "';'");
+            if (find_cfunc(&prog.c_funcs, name))
+                compile_error(line, "'!c %s(...)' declared more than once", name);
+            CFuncDecl d = {0};
+            d.name = name; d.arity = (size_t)num->num; d.line = line;
+            cfunc_push(&prog.c_funcs, d);
+            continue;
+        }
         int line = pcur(&p)->line;
         padv(&p);
         char *name1 = pexpect_name(&p, "a module/file name");
@@ -652,6 +767,13 @@ static Program parse_program(TokList *tl) {
         pexpect(&p, TK_RPAREN, "')'");
         fd.body = parse_block(&p);
         func_push(&prog.funcs, fd);
+    }
+    for (size_t i = 0; i < prog.c_funcs.count; i++) {
+        CFuncDecl *cf = &prog.c_funcs.items[i];
+        for (size_t j = 0; j < prog.funcs.count; j++) {
+            if (strcmp(prog.funcs.items[j].name, cf->name) == 0)
+                compile_error(cf->line, "'!c %s(...)' collides with an STPL function of the same name", cf->name);
+        }
     }
     return prog;
 }
@@ -808,6 +930,7 @@ static CType call_return_type(Node *call) {
     if (call->a->item_count == 1) {
         FuncDef *uf = find_func(m0);
         if (uf) return CT_UNKNOWN; /* return теперь отдаёт Value целиком (число/строка/список) — статически не известно, что именно; редирект в float подстрахован rt_require_number, как и у map.get/file.read.text */
+        if (find_cfunc(&g_prog.c_funcs, m0)) return CT_UNKNOWN; /* внешняя C-функция: та же гарантия — возвращает Value, тип не известен статически */
     }
     if (strcmp(m0, "math") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "count") == 0 && strcmp(call->a->items[2]->str, "equation") == 0)
@@ -907,6 +1030,25 @@ static void gen_call(Node *n) {
             }
             fprintf(g_out, ")");
             free(cid);
+            return;
+        }
+        CFuncDecl *cf = find_cfunc(&g_prog.c_funcs, m0);
+        if (cf) {
+            if (n->item_count != cf->arity)
+                compile_error(n->line, "'%s': external C function (declared '!c %s(%zu)') expects %zu argument(s), got %zu",
+                              m0, m0, cf->arity, cf->arity, n->item_count);
+            /* Внешние C-функции берут и возвращают Value напрямую (тот же ABI,
+             * что и у STPL-функций) — поэтому просто зовём их по имени, без
+             * префикса fn_ и без rt_require_loaded: это не builtin-модуль за
+             * !export, а обычный C-идентификатор, который должен существовать
+             * в каком-нибудь из !c { ... } блоков (иначе это поймает сам gcc
+             * при финальной линковке). */
+            fprintf(g_out, "%s(", m0);
+            for (size_t i = 0; i < n->item_count; i++) {
+                if (i) fprintf(g_out, ", ");
+                gen_expr(n->items[i]);
+            }
+            fprintf(g_out, ")");
             return;
         }
     }
@@ -1504,6 +1646,19 @@ static void generate(FILE *out) {
     fprintf(out, "/* Auto-generated by first-time-stpl from '%s'. Do not edit by hand. */\n", g_src_path ? g_src_path : "?");
     fprintf(out, "#define _GNU_SOURCE\n#include \"stpl_rt.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <pthread.h>\n\n");
 
+    /* !c { ... } blocks, verbatim, in source order — right after the includes
+     * and before anything STPL-generated, so types/functions/macros they
+     * define are visible to the rest of the file (including any generated
+     * calls to functions declared via `!c name(N);`). */
+    if (g_prog.c_blocks.count > 0) {
+        fprintf(out, "/* ---- begin !c blocks (from source) ---- */\n");
+        for (size_t i = 0; i < g_prog.c_blocks.count; i++) {
+            fprintf(out, "#line %d \"%s\"\n", g_prog.c_blocks.items[i].line, g_src_path ? g_src_path : "<stpl>");
+            fprintf(out, "%s\n", g_prog.c_blocks.items[i].text);
+        }
+        fprintf(out, "/* ---- end !c blocks ---- */\n\n");
+    }
+
     for (size_t i = 0; i < g_prog.exports.count; i++) {
         ExportDecl *ed = &g_prog.exports.items[i];
         char *cid = c_ident(ed->name);
@@ -1748,8 +1903,14 @@ int main(int argc, char **argv) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        /* -lm — так, чтобы <math.h>-функции внутри !c { ... } блоков (sqrt,
+         * hypot, pow, ...) линковались из коробки, без отдельной директивы.
+         * Полноценная поддержка произвольных внешних библиотек (-l/-L из
+         * самого STPL-исходника) — отдельная фича, здесь сознательно не
+         * делается: !c даёт только вкрапление/использование C, которое уже
+         * доступно через libc/libm/libpthread. */
         execlp("gcc", "gcc", "-std=gnu11", "-Wall", "-Wextra", "-O2",
-               "-I", rt_h_dir, "-o", outpath, genc_path, rt_c, "-lpthread", (char*)NULL);
+               "-I", rt_h_dir, "-o", outpath, genc_path, rt_c, "-lpthread", "-lm", (char*)NULL);
         fprintf(stderr, "STPL: failed to launch gcc\n");
         _exit(127);
     }
