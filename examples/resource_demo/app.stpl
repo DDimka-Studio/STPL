@@ -1,0 +1,24 @@
+!export display*
+!export resource*
+!export command*
+!export str*
+!export exit*
+!export helper.sh
+!export notes.txt
+
+start main
+
+main() {
+    display.show.text(resource.load.text(notes.txt))
+    display.show.text(str.concat("extracted to: ", resource.extract(helper.sh)))
+    command.execute.show("/bin/sh", str.concat(resource.extract(helper.sh), " world"))
+
+    exit display
+    exit resource
+    exit command
+    exit str
+    exit notes.txt
+    exit helper.sh
+    exit exit
+    return 0
+};
