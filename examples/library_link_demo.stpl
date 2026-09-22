@@ -1,0 +1,42 @@
+// library_link_demo.stpl — using an external C library (SDL2) from STPL.
+//
+// !c only gives you C that's already linked in (libc/libm/libpthread).
+// !pkgconfig (or !link, for a single raw flag) tells gcc what else to
+// link against, so a !c { } block can #include and call into any system
+// C library — here, SDL2 — instead of being limited to the standard
+// library. Needs libsdl2-dev (or your distro's equivalent) installed.
+
+!export display*
+!export exit*
+
+!pkgconfig "sdl2"
+
+!c {
+    #include <SDL2/SDL.h>
+    #include <stdio.h>
+
+    /* SDL_Init/SDL_Quit just to prove the library actually links and
+     * initializes — no window is opened, so this runs fine headless. */
+    Value sdl_report(void) {
+        char buf[256];
+        if (SDL_Init(SDL_INIT_TIMER) != 0) {
+            snprintf(buf, sizeof(buf), "SDL_Init failed: %s", SDL_GetError());
+            return rt_v_str(buf);
+        }
+        SDL_version v;
+        SDL_GetVersion(&v);
+        snprintf(buf, sizeof(buf), "SDL2 %d.%d.%d linked and initialized OK", v.major, v.minor, v.patch);
+        SDL_Quit();
+        return rt_v_str(buf);
+    }
+};
+!c sdl_report(0);
+
+start main
+
+main() {
+    display.show.text(sdl_report())
+    exit display
+    exit exit
+    return 0
+};

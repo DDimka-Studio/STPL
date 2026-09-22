@@ -47,6 +47,7 @@ worker1() {
     exit logic
     exit sleep
     exit counter
+    exit w2_done
     exit exit
     return 0
 };

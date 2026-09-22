@@ -29,6 +29,8 @@ main() {
     exit len
     exit result
     exit i
+    exit pos
+    exit ch
     exit exit
     return 0
 };
