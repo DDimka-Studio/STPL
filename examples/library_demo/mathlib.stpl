@@ -1,0 +1,12 @@
+!c {
+    Value ml_square(Value x) { return rt_v_num(x.num * x.num); }
+};
+!c ml_square(1);
+
+add(float a, float b) {
+    return a + b
+};
+
+greet(int8 name) {
+    return str.concat("hi, ", name)
+};

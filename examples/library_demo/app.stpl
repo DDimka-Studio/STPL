@@ -1,0 +1,18 @@
+!export display*
+!export str*
+!export exit*
+!use "mathlib.stpl"
+!use "stringlib.stpl"
+
+start main
+
+main() {
+    display.show.text(add(3, 4))
+    display.show.text(ml_square(5))
+    display.show.text(shout("stpl"))
+
+    exit display
+    exit str
+    exit exit
+    return 0
+};

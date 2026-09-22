@@ -1,0 +1,5 @@
+!use "mathlib.stpl"
+
+shout(int8 name) {
+    return str.concat(greet(name), "!!!")
+};
