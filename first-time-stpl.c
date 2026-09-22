@@ -1,30 +1,30 @@
-/* first-time-stpl.c — «первое время STPL»: bootstrap-компилятор STPL, v1.
+/* first-time-stpl.c — "first time STPL": the bootstrap compiler for STPL, v1.
  *
- * Схема: STPL исходник -> (лексер -> парсер -> семантика/типы) -> C-код ->
- * gcc -> нативный бинарник. Никакого промежуточного STPL — компилируем
- * напрямую в C, который затем реально линкуется в машинный код.
+ * Pipeline: STPL source -> (lexer -> parser -> semantics/types) -> C code ->
+ * gcc -> a native binary. No intermediate STPL at all — we compile
+ * straight to C, which is then genuinely linked into machine code.
  *
- * Смысл именно в том, чтобы ЭТА программа была написана на C и собиралась
- * gcc под любую архитектуру — это компилятор v1. Дальше на самом STPL
- * пишется компилятор v2; v1 компилирует исходник v2 в нативный бинарник;
- * этот бинарник (уже настоящий компилятор STPL, написанный на STPL) может
- * компилировать сам себя — self-hosting.
+ * The whole point is for THIS program to be written in C and built by
+ * gcc for any architecture — this is compiler v1. Later, compiler v2 gets
+ * written in STPL itself; v1 compiles v2's source into a native binary;
+ * that binary (now a real STPL compiler, written in STPL) can then
+ * compile itself — self-hosting.
  *
- * Отличия от интерпретатора (stpl2.c), потому что теперь это компилятор:
- *  - !export модулей проверяется статически (на этапе компиляции), а не
- *    в момент вызова.
- *  - Типы (float/int8/int(char=N)) проверяются строго на этапе компиляции:
- *    несовместимое присваивание/арифметика — ошибка компиляции, а не
- *    рантайма.
- *  - `start X` (переход и в функции, и на верхнем уровне) резолвится
- *    статически — не существующая функция это ошибка компиляции.
- *  - exit модуля/переменной остаётся runtime-проверкой (loaded-флаг),
- *    потому что порядок exit зависит от потока управления и от других
- *    потоков (start верхнего уровня) — это осознанно оставлено так же,
- *    как и утечки, забота разработчика (см. SPEC.md).
- *  - Файлы-ресурсы (!export photo.png) теперь ДЕЙСТВИТЕЛЬНО дописываются
- *    в хвост скомпилированного бинарника (см. embed_resources) и грузятся
- *    лениво через /proc/self/exe + TOC (см. stpl_rt.c).
+ * Differences from the interpreter (stpl2.c), now that this is a compiler:
+ *  - !export of modules is checked statically (at compile time), not
+ *    at call time.
+ *  - Types (float/int8/int(char=N)) are checked strictly at compile time:
+ *    an incompatible assignment/arithmetic operation is a compile error,
+ *    not a runtime one.
+ *  - `start X` (a jump, both inside a function and at the top level) is
+ *    resolved statically — a non-existent function is a compile error.
+ *  - exit of a module/variable remains a runtime check (the loaded flag),
+ *    because the order of exit depends on control flow and on other
+ *    threads (a top-level start) — this is deliberately left as is,
+ *    same as leaks: the developer's own responsibility (see SPEC.md).
+ *  - Resource files (!export photo.png) are now ACTUALLY appended
+ *    to the tail of the compiled binary (see embed_resources) and loaded
+ *    lazily via /proc/self/exe + a TOC (see stpl_rt.c).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -36,7 +36,7 @@
 #include <sys/wait.h>
 #include <stdarg.h>
 
-/* ============================== Лексер ============================== */
+/* ============================== Lexer ============================== */
 
 typedef enum {
     TK_EOF, TK_IDENT, TK_NUM, TK_STR, TK_ESCAPE,
@@ -56,13 +56,38 @@ typedef struct {
     char *text;
     double num;
     int line;
+    const char *file;   /* which source file this token came from (see !use) */
 } Tok;
 
 typedef struct { Tok *items; size_t count, cap; } TokList;
 
+/* The file every token pushed right now is stamped as coming from — set by
+ * lex_into() around a whole file (and saved/restored around a nested !use),
+ * so every Tok ends up correctly attributed even though !use is expanded
+ * by splicing tokens directly into one shared TokList (see lex_into). */
+static const char *g_lex_cur_file = "<input>";
+
 static void tok_push(TokList *tl, Tok t) {
+    t.file = g_lex_cur_file;
     if (tl->count == tl->cap) { tl->cap = tl->cap ? tl->cap * 2 : 128; tl->items = realloc(tl->items, tl->cap * sizeof(Tok)); }
     tl->items[tl->count++] = t;
+}
+
+typedef struct { char **items; size_t count, cap; } StrList;
+static void str_push(StrList *sl, char *s) {
+    if (sl->count == sl->cap) { sl->cap = sl->cap ? sl->cap*2 : 8; sl->items = realloc(sl->items, sl->cap*sizeof(char*)); }
+    sl->items[sl->count++] = s;
+}
+static int str_list_contains(StrList *sl, const char *s) {
+    for (size_t i = 0; i < sl->count; i++) if (strcmp(sl->items[i], s) == 0) return 1;
+    return 0;
+}
+static char *dirname_of(const char *path) {
+    char *cp = strdup(path);
+    char *slash = strrchr(cp, '/');
+    if (!slash) { free(cp); return strdup("."); }
+    *slash = '\0';
+    return cp;
 }
 static char *dupn(const char *s, size_t n) { char *r = malloc(n + 1); memcpy(r, s, n); r[n] = '\0'; return r; }
 
@@ -76,8 +101,84 @@ static KW keywords[] = {
     {NULL, TK_EOF}
 };
 
-static TokList lex(const char *src) {
-    TokList tl = {0};
+/* Global bookkeeping for !use (library inclusion) — see the lexer's '!'
+ * dispatch below. g_use_stack holds the chain of files currently being
+ * expanded (for circular-!use detection); g_use_done holds every file
+ * already fully spliced in (so a diamond dependency — two libraries both
+ * !use-ing a third — includes it once, "#pragma once" style, rather than
+ * erroring on duplicate definitions). Both hold canonicalized (realpath)
+ * paths. g_main_resolved_file is the entry file's own canonical path,
+ * used later to reject a top-level `start` that came from a library. */
+static StrList g_use_stack;
+static StrList g_use_done;
+static const char *g_main_resolved_file = NULL;
+
+/* Global bookkeeping for !link / !pkgconfig (external C libraries — see the
+ * lexer's '!' dispatch below, next to !use). Every flag collected here is
+ * appended verbatim to the final gcc command line that links the compiled
+ * binary, in source order, so an STPL program can pull in any system C
+ * library (SDL2, libcurl, ...) that its !c blocks then #include/call into. */
+static StrList g_link_flags;
+
+static char *resolve_path_or_die(const char *raw_path, const char *from_file, int line) {
+    char *dir = dirname_of(from_file);
+    char joined[4096];
+    snprintf(joined, sizeof(joined), "%s/%s", dir, raw_path);
+    free(dir);
+    char *resolved = realpath(joined, NULL);
+    if (!resolved) {
+        fprintf(stderr, "STPL: !use (line %d, in '%s'): cannot open library file '%s'\n", line, from_file, raw_path);
+        exit(1);
+    }
+    return resolved;
+}
+
+/* Runs `pkg-config --cflags --libs <pkg>` and splits the (whitespace
+ * separated) output into individual flags, pushed onto *out in order. This
+ * is what !pkgconfig "name" expands to. pkg is restricted to a conservative
+ * safe charset before it ever reaches a shell, since it's spliced into a
+ * popen() command line. */
+static void pkgconfig_flags_or_die(const char *pkg, const char *from_file, int line, StrList *out) {
+    for (const char *p = pkg; *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '+' || *p == '.' || *p == '_')) {
+            fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): invalid character in package name '%s' — only letters, digits, '-', '+', '.', '_' are allowed\n", line, from_file, pkg);
+            exit(1);
+        }
+    }
+    if (pkg[0] == '\0') {
+        fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): empty package name\n", line, from_file);
+        exit(1);
+    }
+    char cmd[4200];
+    snprintf(cmd, sizeof(cmd), "pkg-config --cflags --libs %s 2>/dev/null", pkg);
+    FILE *pf = popen(cmd, "r");
+    if (!pf) {
+        fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): failed to run pkg-config\n", line, from_file);
+        exit(1);
+    }
+    char buf[4096];
+    size_t got = fread(buf, 1, sizeof(buf) - 1, pf);
+    buf[got] = '\0';
+    int status = pclose(pf);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): pkg-config couldn't find package '%s' (is it installed, and is pkg-config on PATH?)\n", line, from_file, pkg);
+        exit(1);
+    }
+    size_t added = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(buf, " \t\r\n", &saveptr); tok; tok = strtok_r(NULL, " \t\r\n", &saveptr)) {
+        str_push(out, strdup(tok));
+        added++;
+    }
+    if (added == 0) {
+        fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): pkg-config returned no flags for '%s'\n", line, from_file, pkg);
+        exit(1);
+    }
+}
+
+static void lex_into(const char *src, const char *filepath, TokList *tl) {
+    const char *prev_file = g_lex_cur_file;
+    g_lex_cur_file = filepath;
     size_t i = 0, n = strlen(src);
     int line = 1;
     while (i < n) {
@@ -93,27 +194,27 @@ static TokList lex(const char *src) {
                 i++; while (i < n && isdigit((unsigned char)src[i])) i++;
             }
             char *txt = dupn(src+s, i-s);
-            Tok t = {TK_NUM, txt, atof(txt), line};
-            tok_push(&tl, t);
+            Tok t = {TK_NUM, txt, atof(txt), line, NULL};
+            tok_push(tl, t);
             continue;
         }
 
         if (isalpha((unsigned char)c) || c == '_') {
             size_t s = i;
             i++;
-            /* '-' допустим внутри идентификатора (ради вещей вроде
-             * kitty-xterm в term.stpl), но ТОЛЬКО если за ним следует
-             * буква, а не цифра — иначе "n-1" в арифметике проглатывался
-             * бы целиком как один идентификатор вместо "n", "-", "1"
-             * (нашлось на реальном тесте рекурсии с function-параметрами:
-             * n-1 внутри вызова молча переставало быть вычитанием). */
+            /* '-' is allowed inside an identifier (for things like
+             * kitty-xterm in term.stpl), but ONLY if it's followed by a
+             * letter, not a digit — otherwise "n-1" in an arithmetic
+             * expression would get swallowed whole as one identifier
+             * instead of "n", "-", "1" (found via a real recursion test
+             * with function parameters: n-1 inside a call silently stopped being a subtraction). */
             while (i < n && (isalnum((unsigned char)src[i]) || src[i] == '_' ||
                    (src[i] == '-' && i+1 < n && isalpha((unsigned char)src[i+1])))) i++;
             char *txt = dupn(src+s, i-s);
             TokType kt = TK_IDENT;
             for (KW *k = keywords; k->w; k++) if (strcmp(k->w, txt) == 0) { kt = k->t; break; }
-            Tok t = {kt, txt, 0, line};
-            tok_push(&tl, t);
+            Tok t = {kt, txt, 0, line, NULL};
+            tok_push(tl, t);
             continue;
         }
 
@@ -123,8 +224,8 @@ static TokList lex(const char *src) {
             while (i < n && src[i] != '"') { if (bi < sizeof(buf)-1) buf[bi++] = src[i]; i++; }
             if (i < n) i++;
             buf[bi] = '\0';
-            Tok t = {TK_STR, dupn(buf, bi), 0, line};
-            tok_push(&tl, t);
+            Tok t = {TK_STR, dupn(buf, bi), 0, line, NULL};
+            tok_push(tl, t);
             continue;
         }
 
@@ -132,15 +233,137 @@ static TokList lex(const char *src) {
             char e = src[i+1];
             char ch = (e == 'n') ? '\n' : (e == 't') ? '\t' : (e == 'r') ? '\r' : e;
             char txt[2] = { ch, '\0' };
-            Tok t = {TK_ESCAPE, dupn(txt, 1), 0, line};
-            tok_push(&tl, t);
+            Tok t = {TK_ESCAPE, dupn(txt, 1), 0, line, NULL};
+            tok_push(tl, t);
             i += 2;
             continue;
         }
 
         if (c == '!') {
-            if (i+1 < n && src[i+1] == '=') { Tok t = {TK_NEQ, NULL, 0, line}; tok_push(&tl, t); i += 2; continue; }
-            if (i+7 <= n && strncmp(src+i+1, "export", 6) == 0) { Tok t = {TK_EXPORT_DIRECTIVE, NULL, 0, line}; tok_push(&tl, t); i += 7; continue; }
+            if (i+1 < n && src[i+1] == '=') { Tok t = {TK_NEQ, NULL, 0, line, NULL}; tok_push(tl, t); i += 2; continue; }
+            if (i+7 <= n && strncmp(src+i+1, "export", 6) == 0) { Tok t = {TK_EXPORT_DIRECTIVE, NULL, 0, line, NULL}; tok_push(tl, t); i += 7; continue; }
+            /* !use "path/to/library.stpl" — pulls another STPL file's functions,
+             * !export lines, and !c blocks/declarations into this one, as if
+             * its text had been pasted in right here (an #include, not a
+             * linked module: everything ends up in one shared namespace, so
+             * duplicate function names across files are a compile error, same
+             * as within one file). The path is resolved relative to the
+             * directory of the file containing the !use, not the entry file,
+             * so a library can itself !use its own neighbors. A file that's
+             * !use'd more than once (a diamond dependency) is only spliced in
+             * the first time; a !use cycle (A uses B uses A) is a compile
+             * error instead of infinite recursion. This whole directive is
+             * resolved right here in the lexer, before parsing ever starts —
+             * the parser never even sees a "!use" token. */
+            if (i+4 <= n && strncmp(src+i+1, "use", 3) == 0 && !(i+4 < n && (isalnum((unsigned char)src[i+4]) || src[i+4] == '_'))) {
+                size_t j = i + 4;
+                int use_line = line;
+                while (j < n && isspace((unsigned char)src[j])) { if (src[j] == '\n') line++; j++; }
+                if (j >= n || src[j] != '"') {
+                    fprintf(stderr, "STPL: !use (line %d, in '%s'): expected a quoted path, e.g. !use \"mathlib.stpl\"\n", use_line, filepath);
+                    exit(1);
+                }
+                j++;
+                size_t ps = j;
+                while (j < n && src[j] != '"' && src[j] != '\n') j++;
+                if (j >= n || src[j] != '"') {
+                    fprintf(stderr, "STPL: !use (line %d, in '%s'): unterminated path string\n", use_line, filepath);
+                    exit(1);
+                }
+                char *raw_path = dupn(src + ps, j - ps);
+                j++;
+                i = j;
+                char *resolved = resolve_path_or_die(raw_path, filepath, use_line);
+                free(raw_path);
+                if (str_list_contains(&g_use_done, resolved)) {
+                    /* already fully included elsewhere — skip silently (diamond dependency) */
+                    free(resolved);
+                    continue;
+                }
+                if (str_list_contains(&g_use_stack, resolved)) {
+                    fprintf(stderr, "STPL: !use (line %d, in '%s'): circular include of '%s'\n", use_line, filepath, resolved);
+                    exit(1);
+                }
+                FILE *lf = fopen(resolved, "rb");
+                if (!lf) {
+                    fprintf(stderr, "STPL: !use (line %d, in '%s'): cannot open '%s'\n", use_line, filepath, resolved);
+                    exit(1);
+                }
+                fseek(lf, 0, SEEK_END); long lsz = ftell(lf); fseek(lf, 0, SEEK_SET);
+                char *lsrc = malloc((size_t)lsz + 1);
+                size_t lrd = fread(lsrc, 1, (size_t)lsz, lf);
+                lsrc[lrd] = '\0';
+                fclose(lf);
+                str_push(&g_use_stack, resolved);
+                lex_into(lsrc, resolved, tl);
+                g_use_stack.count--; /* pop */
+                str_push(&g_use_done, resolved);
+                free(lsrc);
+                continue;
+            }
+            /* !link "flag" — passes an arbitrary flag (e.g. "-lSDL2",
+             * "-lcurl", "-L/usr/local/lib", "-I/usr/include/SDL2") straight
+             * through to the gcc invocation that links the final binary, in
+             * source order. This is what makes any system C library usable
+             * from a !c { } block — !c gives you the C, !link gives you
+             * what to link it against. Resolved right here in the lexer,
+             * same as !use — no token is emitted, the flag is just recorded
+             * into g_link_flags. */
+            if (i+5 <= n && strncmp(src+i+1, "link", 4) == 0 && !(i+5 < n && (isalnum((unsigned char)src[i+5]) || src[i+5] == '_'))) {
+                size_t j = i + 5;
+                int link_line = line;
+                while (j < n && isspace((unsigned char)src[j])) { if (src[j] == '\n') line++; j++; }
+                if (j >= n || src[j] != '"') {
+                    fprintf(stderr, "STPL: !link (line %d, in '%s'): expected a quoted flag, e.g. !link \"-lSDL2\"\n", link_line, filepath);
+                    exit(1);
+                }
+                j++;
+                size_t fs = j;
+                while (j < n && src[j] != '"' && src[j] != '\n') j++;
+                if (j >= n || src[j] != '"') {
+                    fprintf(stderr, "STPL: !link (line %d, in '%s'): unterminated flag string\n", link_line, filepath);
+                    exit(1);
+                }
+                char *flag = dupn(src + fs, j - fs);
+                j++;
+                i = j;
+                if (flag[0] == '\0') {
+                    fprintf(stderr, "STPL: !link (line %d, in '%s'): empty flag\n", link_line, filepath);
+                    exit(1);
+                }
+                str_push(&g_link_flags, flag);
+                continue;
+            }
+            /* !pkgconfig "package" — shells out to `pkg-config --cflags
+             * --libs <package>` at compile time and splits the result into
+             * individual flags appended to the same list !link feeds. This
+             * covers libraries whose build requirements are more than one
+             * plain "-lname" (extra -I/-L paths, several -l flags, e.g.
+             * sdl2 or gtk+-3.0), without the STPL source having to spell
+             * each flag out by hand. Requires pkg-config, and the target
+             * package's .pc file, on the machine doing the build. */
+            if (i+11 <= n && strncmp(src+i+1, "pkgconfig", 9) == 0 && !(i+11 < n && (isalnum((unsigned char)src[i+11]) || src[i+11] == '_'))) {
+                size_t j = i + 11;
+                int pc_line = line;
+                while (j < n && isspace((unsigned char)src[j])) { if (src[j] == '\n') line++; j++; }
+                if (j >= n || src[j] != '"') {
+                    fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): expected a quoted package name, e.g. !pkgconfig \"sdl2\"\n", pc_line, filepath);
+                    exit(1);
+                }
+                j++;
+                size_t ps = j;
+                while (j < n && src[j] != '"' && src[j] != '\n') j++;
+                if (j >= n || src[j] != '"') {
+                    fprintf(stderr, "STPL: !pkgconfig (line %d, in '%s'): unterminated package name string\n", pc_line, filepath);
+                    exit(1);
+                }
+                char *pkg = dupn(src + ps, j - ps);
+                j++;
+                i = j;
+                pkgconfig_flags_or_die(pkg, filepath, pc_line, &g_link_flags);
+                free(pkg);
+                continue;
+            }
             /* !c — inline raw C. Two forms:
              *   !c { <raw C code> }        — copied byte-for-byte into the generated
              *                                 .c file (right after the includes), so
@@ -195,20 +418,20 @@ static TokList lex(const char *src) {
                         fprintf(stderr, "STPL: unterminated '!c { ... }' block starting at line %d\n", block_start_line);
                         exit(1);
                     }
-                    Tok t = {TK_C_BLOCK, dupn(src + start, k - start), 0, block_start_line};
-                    tok_push(&tl, t);
+                    Tok t = {TK_C_BLOCK, dupn(src + start, k - start), 0, block_start_line, NULL};
+                    tok_push(tl, t);
                     i = k + 1; /* skip past the matching '}' */
                     continue;
                 }
-                Tok t = {TK_C_DIRECTIVE, NULL, 0, line};
-                tok_push(&tl, t);
+                Tok t = {TK_C_DIRECTIVE, NULL, 0, line, NULL};
+                tok_push(tl, t);
                 i += 2;
                 continue;
             }
             fprintf(stderr, "STPL: unexpected '!' at line %d\n", line); exit(1);
         }
 
-        Tok t = {TK_EOF, NULL, 0, line};
+        Tok t = {TK_EOF, NULL, 0, line, NULL};
         switch (c) {
             case '+': t.type = TK_PLUS; i++; break;
             case '-': t.type = TK_MINUS; i++; break;
@@ -247,11 +470,9 @@ static TokList lex(const char *src) {
                 exit(1);
         }
         t.line = line;
-        tok_push(&tl, t);
+        tok_push(tl, t);
     }
-    Tok eof = {TK_EOF, NULL, 0, line};
-    tok_push(&tl, eof);
-    return tl;
+    g_lex_cur_file = prev_file;
 }
 
 /* ============================== AST ============================== */
@@ -289,7 +510,7 @@ static void npush(Node *n, Node *c) {
 }
 
 typedef struct { char *name; int is_float; int line; } Param; /* is_float: 1=float, 0=int8 */
-typedef struct { char *name; Node *body; int cpu; int has_cpu; Param *params; size_t param_count; int line; } FuncDef;
+typedef struct { char *name; Node *body; int cpu; int has_cpu; Param *params; size_t param_count; int line; const char *file; } FuncDef;
 typedef struct { FuncDef *items; size_t count, cap; } FuncList;
 static void func_push(FuncList *fl, FuncDef f) {
     if (fl->count == fl->cap) { fl->cap = fl->cap ? fl->cap*2 : 8; fl->items = realloc(fl->items, fl->cap*sizeof(FuncDef)); }
@@ -301,12 +522,6 @@ typedef struct { ExportDecl *items; size_t count, cap; } ExportList;
 static void export_push(ExportList *el, ExportDecl e) {
     if (el->count == el->cap) { el->cap = el->cap ? el->cap*2 : 8; el->items = realloc(el->items, el->cap*sizeof(ExportDecl)); }
     el->items[el->count++] = e;
-}
-
-typedef struct { char **items; size_t count, cap; } StrList;
-static void str_push(StrList *sl, char *s) {
-    if (sl->count == sl->cap) { sl->cap = sl->cap ? sl->cap*2 : 8; sl->items = realloc(sl->items, sl->cap*sizeof(char*)); }
-    sl->items[sl->count++] = s;
 }
 
 /* !c { ... } raw blocks — kept in source order and emitted verbatim into the
@@ -333,7 +548,7 @@ static CFuncDecl *find_cfunc(CFuncList *cl, const char *name) {
     return NULL;
 }
 
-/* ============================== Парсер ============================== */
+/* ============================== Parser ============================== */
 
 typedef struct { TokList *tl; size_t pos; } Parser;
 static Tok *pcur(Parser *p) { return &p->tl->items[p->pos]; }
@@ -342,14 +557,14 @@ static Tok *padv(Parser *p) { Tok *t = pcur(p); if (p->pos < p->tl->count-1) p->
 static int pcheck(Parser *p, TokType t) { return pcur(p)->type == t; }
 static int pmatch(Parser *p, TokType t) { if (pcheck(p,t)) { padv(p); return 1; } return 0; }
 static void pexpect(Parser *p, TokType t, const char *what) {
-    if (!pcheck(p,t)) { fprintf(stderr, "STPL: syntax error (line %d): expected %s\n", pcur(p)->line, what); exit(1); }
+    if (!pcheck(p,t)) { fprintf(stderr, "STPL: syntax error (%s:%d): expected %s\n", pcur(p)->file, pcur(p)->line, what); exit(1); }
     padv(p);
 }
 
 static char *pexpect_name(Parser *p, const char *what) {
     Tok *t = pcur(p);
     if (!t->text) {
-        fprintf(stderr, "STPL: syntax error (line %d): expected %s\n", t->line, what);
+        fprintf(stderr, "STPL: syntax error (%s:%d): expected %s\n", t->file, t->line, what);
         exit(1);
     }
     char *s = strdup(t->text);
@@ -396,7 +611,7 @@ static Node *parse_atom(Parser *p) {
                 npush(namelist, nm);
             }
             call->a = namelist;
-            call->str2 = stream; /* NULL = поток не указан, дефолт решает конкретный builtin */
+            call->str2 = stream; /* NULL = no stream given, the specific builtin decides the default */
             if (!pcheck(p, TK_RPAREN)) {
                 npush(call, parse_expr(p));
                 while (pmatch(p, TK_COMMA)) npush(call, parse_expr(p));
@@ -406,7 +621,7 @@ static Node *parse_atom(Parser *p) {
             return call;
         }
         if (stream) {
-            fprintf(stderr, "STPL: syntax error (line %d): '::%s' is only valid on a call, e.g. name.method::%s(...)\n", first->line, stream, stream);
+            fprintf(stderr, "STPL: syntax error (%s:%d): '::%s' is only valid on a call, e.g. name.method::%s(...)\n", first->file, first->line, stream, stream);
             exit(1);
         }
         if (chain.count >= 2) {
@@ -426,7 +641,7 @@ static Node *parse_atom(Parser *p) {
         free(chain.items);
         return n;
     }
-    fprintf(stderr, "STPL: syntax error (line %d): unexpected token\n", t->line);
+    fprintf(stderr, "STPL: syntax error (%s:%d): unexpected token\n", t->file, t->line);
     exit(1);
 }
 
@@ -454,14 +669,14 @@ static Node *parse_addsub(Parser *p) {
     return left;
 }
 
-/* Побитовые операции — новый верхний уровень цепочки разбора выражений
- * (ниже по приоритету, чем + - * и /, как и в C): сдвиги -> амперсанд
- * -> XOR -> побитовое ИЛИ. Операнды по-прежнему float на уровне STPL,
- * но при кодогенерации для этих операторов приводятся к целому
- * (long long) перед самой операцией и обратно к double после — иначе
- * побитовая операция над "сырым" double в C попросту не
- * скомпилируется. Унарного побитового НЕ пока нет — как и унарного
- * минуса, обходится через "x ^ 255" и т.п. */
+/* Bitwise operators — a new top level in the expression-parsing chain
+ * (lower precedence than + - * and /, same as in C): shifts -> ampersand
+ * -> XOR -> bitwise OR. Operands are still float at the STPL level,
+ * but during codegen these operators are cast to an integer type
+ * (long long) right before the operation and back to double right
+ * after — otherwise a bitwise operation on a "raw" double in C simply
+ * wouldn't compile. There's no unary bitwise NOT yet — same as unary
+ * minus, worked around via "x ^ 255" and the like. */
 static Node *parse_shift(Parser *p) {
     Node *left = parse_addsub(p);
     while (pcheck(p, TK_SHL) || pcheck(p, TK_SHR)) {
@@ -512,7 +727,7 @@ static Node *parse_word(Parser *p) {
     if (t->type == TK_NUM) { padv(p); Node *n = nn(N_NUM, t->line); n->num = t->num; return n; }
     if (t->type == TK_STR) { padv(p); Node *n = nn(N_STR, t->line); n->str = strdup(t->text); return n; }
     if (t->type == TK_IDENT) { padv(p); Node *n = nn(N_STR, t->line); n->str = strdup(t->text); return n; }
-    fprintf(stderr, "STPL: syntax error (line %d): expected a value\n", t->line);
+    fprintf(stderr, "STPL: syntax error (%s:%d): expected a value\n", t->file, t->line);
     exit(1);
 }
 
@@ -530,7 +745,7 @@ static Node *parse_cond(Parser *p) {
     Node *left = parse_expr(p);
     Tok *op = pcur(p);
     if (!is_comparison_tok(op->type)) {
-        fprintf(stderr, "STPL: syntax error (line %d): expected a comparison operator\n", op->line);
+        fprintf(stderr, "STPL: syntax error (%s:%d): expected a comparison operator\n", op->file, op->line);
         exit(1);
     }
     padv(p);
@@ -602,12 +817,12 @@ static Node *parse_statement(Parser *p) {
     if (t->type == TK_LOOP) {
         padv(p);
         pexpect(p, TK_REPEAT, "'repeat'");
-        /* Раньше — только числовой литерал; теперь — произвольное числовое
-         * выражение, посчитанное один раз ДО первой итерации (не на каждый
-         * проход). Нужно, чтобы можно было пройтись по строке заранее
-         * неизвестной длины: loop repeat str.length(s) { ... }. Обратная
-         * совместимость полная — "loop repeat 10" по-прежнему просто
-         * литерал-выражение из одного числа. */
+        /* It used to be just a numeric literal; now it's an arbitrary numeric
+         * expression, evaluated once BEFORE the first iteration (not on every
+         * pass). Needed so you can walk a string whose length isn't known
+         * ahead of time: loop repeat str.length(s) { ... }. Full backward
+         * compatibility — "loop repeat 10" is still simply a single-number
+         * literal expression. */
         Node *count_expr = parse_expr(p);
         Node *body = parse_block(p);
         Node *n = nn(N_LOOP_REPEAT, t->line);
@@ -672,7 +887,15 @@ static Program parse_program(TokList *tl) {
     Parser p = {tl, 0};
     Program prog = {0};
 
-    while (pcheck(&p, TK_EXPORT_DIRECTIVE) || pcheck(&p, TK_C_BLOCK) || pcheck(&p, TK_C_DIRECTIVE)) {
+    /* !export / !c { } / !c name(N); / start X / funcdefs may now appear in
+     * any order and interleaved (this used to be three strict, separately-
+     * ordered passes) — needed for !use to work naturally: a !use'd
+     * library's function definitions get spliced in as tokens exactly where
+     * the !use line was written, so if !export/start/funcdefs each had to
+     * stay in their own contiguous block, where you were "allowed" to put a
+     * !use would depend on what the library happened to contain. One
+     * unified loop removes that trap entirely. */
+    while (!pcheck(&p, TK_EOF)) {
         if (pcheck(&p, TK_C_BLOCK)) {
             Tok *t = padv(&p);
             CBlock b = { strdup(t->text), t->line };
@@ -697,35 +920,42 @@ static Program parse_program(TokList *tl) {
             cfunc_push(&prog.c_funcs, d);
             continue;
         }
-        int line = pcur(&p)->line;
-        padv(&p);
-        char *name1 = pexpect_name(&p, "a module/file name");
-        ExportDecl ed = {0};
-        ed.line = line;
-        if (pcheck(&p, TK_DOT)) {
+        if (pcheck(&p, TK_EXPORT_DIRECTIVE)) {
+            int line = pcur(&p)->line;
             padv(&p);
-            char *name2 = pexpect_name(&p, "a file extension");
-            char buf[512]; snprintf(buf, sizeof(buf), "%s.%s", name1, name2);
-            ed.name = strdup(buf); ed.is_resource = 1;
-            free(name1); free(name2);
-        } else if (pmatch(&p, TK_STAR)) {
-            ed.name = name1; ed.is_builtin = 1;
-        } else {
-            ed.name = name1; ed.is_builtin = 1;
+            char *name1 = pexpect_name(&p, "a module/file name");
+            ExportDecl ed = {0};
+            ed.line = line;
+            if (pcheck(&p, TK_DOT)) {
+                padv(&p);
+                char *name2 = pexpect_name(&p, "a file extension");
+                char buf[512]; snprintf(buf, sizeof(buf), "%s.%s", name1, name2);
+                ed.name = strdup(buf); ed.is_resource = 1;
+                free(name1); free(name2);
+            } else if (pmatch(&p, TK_STAR)) {
+                ed.name = name1; ed.is_builtin = 1;
+            } else {
+                ed.name = name1; ed.is_builtin = 1;
+            }
+            export_push(&prog.exports, ed);
+            continue;
         }
-        export_push(&prog.exports, ed);
-    }
-    while (pcheck(&p, TK_START)) {
-        padv(&p);
-        char *name = pexpect_name(&p, "a function name");
-        str_push(&prog.top_starts, name);
-    }
-    while (!pcheck(&p, TK_EOF)) {
+        if (pcheck(&p, TK_START)) {
+            Tok *st = pcur(&p);
+            if (g_main_resolved_file && st->file && strcmp(st->file, g_main_resolved_file) != 0) {
+                compile_error(st->line, "a top-level 'start' is only allowed in the main file being compiled, not in a library pulled in via !use ('%s') — call the library's functions from your own 'start' instead", st->file);
+            }
+            padv(&p);
+            char *name = pexpect_name(&p, "a function name");
+            str_push(&prog.top_starts, name);
+            continue;
+        }
         int line = pcur(&p)->line;
+        const char *fdfile = pcur(&p)->file;
         char *name = pexpect_name(&p, "a function name");
         pexpect(&p, TK_LPAREN, "'('");
         FuncDef fd = {0};
-        fd.name = name; fd.line = line;
+        fd.name = name; fd.line = line; fd.file = fdfile;
         if (pcheck(&p, TK_CPU)) {
             padv(&p);
             Tok *num = pcur(&p); pexpect(&p, TK_NUM, "a core number");
@@ -733,13 +963,13 @@ static Program parse_program(TokList *tl) {
             if (fd.cpu < 0)
                 compile_error(line, "cpu %d: core number cannot be negative (0-based)", fd.cpu);
         } else if (!pcheck(&p, TK_RPAREN)) {
-            /* Список параметров: "тип имя, тип имя, ...". Пока поддержаны
-             * только float и int8 — int(char=N) как параметр пока не
-             * реализован (см. SPEC, раздел про call/return). Параметры —
-             * это настоящие C-параметры функции (Value), а не глобальные
-             * переменные: именно это даёт честную рекурсию для их данных
-             * (в отличие от `float x = ...` внутри тела, которые по-прежнему
-             * общие глобальные слоты). */
+            /* Parameter list: "type name, type name, ...". Only float and int8
+             * are supported so far — int(char=N) as a parameter isn't
+             * implemented yet (see SPEC, the section on call/return). Parameters
+             * are genuine C function parameters (Value), not global variables:
+             * that's exactly what gives honest recursion for their data (unlike
+             * `float x = ...` inside a body, which is still a shared global
+             * slot). */
             size_t cap = 0;
             for (;;) {
                 Tok *tt = pcur(&p);
@@ -749,7 +979,7 @@ static Program parse_program(TokList *tl) {
                 else if (tt->type == TK_INT) {
                     compile_error(tt->line, "int(char=N) parameters are not supported yet — use float or int8");
                 } else {
-                    fprintf(stderr, "STPL: syntax error (line %d): expected a parameter type (float/int8)\n", tt->line);
+                    fprintf(stderr, "STPL: syntax error (%s:%d): expected a parameter type (float/int8)\n", tt->file, tt->line);
                     exit(1);
                 }
                 char *pname = pexpect_name(&p, "a parameter name");
@@ -766,6 +996,11 @@ static Program parse_program(TokList *tl) {
         }
         pexpect(&p, TK_RPAREN, "')'");
         fd.body = parse_block(&p);
+        for (size_t j = 0; j < prog.funcs.count; j++) {
+            if (strcmp(prog.funcs.items[j].name, fd.name) == 0)
+                compile_error(fd.line, "function '%s' is already defined (in '%s', line %d) — likely two !use'd files defining the same name",
+                              fd.name, prog.funcs.items[j].file ? prog.funcs.items[j].file : "?", prog.funcs.items[j].line);
+        }
         func_push(&prog.funcs, fd);
     }
     for (size_t i = 0; i < prog.c_funcs.count; i++) {
@@ -778,7 +1013,7 @@ static Program parse_program(TokList *tl) {
     return prog;
 }
 
-/* ============================== Семантика / типы ============================== */
+/* ============================== Semantics / types ============================== */
 
 static Program g_prog;
 static const char *g_src_dir = ".";
@@ -858,6 +1093,48 @@ static void collect_decls_block(Node *blk, const char *owner_func) {
     for (size_t i = 0; i < blk->item_count; i++) collect_decls_stmt(blk->items[i], owner_func);
 }
 
+/* Walks EVERY node reachable from n — generically, via a/b/c/items, so it
+ * doesn't matter how deeply a call or an exit is nested inside other
+ * expressions (a var-decl initializer, an if-condition, a redirect's
+ * right-hand side, ...). Used by the "exit is mandatory" check below:
+ * - every `module.method(...)` call and every bareword resource reference
+ *   records that module/resource name into `used`
+ * - every `exit name` records `name` into `exited` — and, since using
+ *   `exit` at all requires `!export exit*`, also records "exit" itself
+ *   into `used` (so a program that exits things is also required to
+ *   exit the exit module, matching the convention already used in
+ *   examples/calculator.stpl and examples/fibonacci.stpl)
+ * - every `type name = ...` declaration records `name` into `declared`
+ * This is a presence check, not a control-flow/path-sensitive one: it
+ * doesn't know whether the `exit` it found is reachable on every path out
+ * of the function, only that it's written somewhere in the body. */
+static void collect_lifecycle(Node *n, StrList *used, StrList *declared, StrList *exited) {
+    if (!n) return;
+    switch (n->type) {
+        case N_CALL:
+            if (n->a && n->a->item_count >= 2) {
+                const char *m0 = n->a->items[0]->str;
+                if (m0 && !str_list_contains(used, m0)) str_push(used, strdup(m0));
+            }
+            break;
+        case N_RESOURCE:
+            if (n->str && !str_list_contains(used, n->str)) str_push(used, strdup(n->str));
+            break;
+        case N_VAR_DECL:
+            if (n->str2 && !str_list_contains(declared, n->str2)) str_push(declared, strdup(n->str2));
+            break;
+        case N_EXIT:
+            if (n->str && !str_list_contains(exited, n->str)) str_push(exited, strdup(n->str));
+            if (!str_list_contains(used, "exit")) str_push(used, strdup("exit"));
+            break;
+        default: break;
+    }
+    collect_lifecycle(n->a, used, declared, exited);
+    collect_lifecycle(n->b, used, declared, exited);
+    collect_lifecycle(n->c, used, declared, exited);
+    for (size_t i = 0; i < n->item_count; i++) collect_lifecycle(n->items[i], used, declared, exited);
+}
+
 static FuncDef *find_func(const char *name) {
     for (size_t i = 0; i < g_prog.funcs.count; i++) if (strcmp(g_prog.funcs.items[i].name, name) == 0) return &g_prog.funcs.items[i];
     return NULL;
@@ -874,11 +1151,11 @@ static int export_is_resource(const char *name) {
 }
 
 static CType call_return_type(Node *call);
-/* Текущая функция, чьё тело генерируется/типизируется — нужно, чтобы
- * N_IDENT мог сначала проверить параметры этой функции (настоящие
- * C-параметры, свой стек-фрейм на каждый вызов — отсюда честная
- * рекурсия для их данных) и только потом общие глобальные переменные.
- * Сбрасывается перед обработкой тела каждой новой функции. */
+/* The current function whose body is being generated/typechecked —
+ * needed so N_IDENT can first check this function's parameters (real
+ * C parameters, their own stack frame per call — hence honest
+ * recursion for their data) and only then the shared global
+ * variables. Reset before processing the body of each new function. */
 static FuncDef *g_cur_func = NULL;
 static Param *find_param(const char *name) {
     if (!g_cur_func) return NULL;
@@ -886,13 +1163,13 @@ static Param *find_param(const char *name) {
         if (strcmp(g_cur_func->params[i].name, name) == 0) return &g_cur_func->params[i];
     return NULL;
 }
-/* Поиск переменной "с точки зрения текущей функции": сначала — среди
- * локальных переменных ТЕКУЩЕЙ функции (только у функций с параметрами
- * есть настоящие локали — свой стек-фрейм на вызов, отсюда честная
- * рекурсия), и только если там не нашлось — среди общих глобальных
- * переменных (переменные функций без параметров, как и раньше,
- * попадают в общее адресное пространство и видны из exit в других
- * функциях). Локальная переменная одноимённо "затеняет" глобальную. */
+/* Variable lookup "from the current function's point of view": first
+ * among the CURRENT function's local variables (only functions with
+ * parameters have real locals — their own stack frame per call, hence
+ * honest recursion), and only if not found there — among the shared
+ * global variables (variables of parameter-less functions, as before,
+ * land in the shared address space and are visible from exit in other
+ * functions). A local variable of the same name "shadows" the global one. */
 static VarSym *varsym_lookup(const char *name) {
     if (g_cur_func) {
         VarSym *v = varsym_find_exact(name, g_cur_func->name);
@@ -915,7 +1192,7 @@ static CType infer_expr_type(Node *n) {
             if (pr) return pr->is_float ? CT_FLOAT : CT_INT8;
             VarSym *vs = varsym_lookup(n->str);
             if (vs) return vs->ctype;
-            return CT_UNKNOWN; /* переменная окружения */
+            return CT_UNKNOWN; /* an environment variable */
         }
         case N_CALL: return call_return_type(n);
         case N_STR:
@@ -929,8 +1206,8 @@ static CType call_return_type(Node *call) {
     const char *m0 = call->a->items[0]->str;
     if (call->a->item_count == 1) {
         FuncDef *uf = find_func(m0);
-        if (uf) return CT_UNKNOWN; /* return теперь отдаёт Value целиком (число/строка/список) — статически не известно, что именно; редирект в float подстрахован rt_require_number, как и у map.get/file.read.text */
-        if (find_cfunc(&g_prog.c_funcs, m0)) return CT_UNKNOWN; /* внешняя C-функция: та же гарантия — возвращает Value, тип не известен статически */
+        if (uf) return CT_UNKNOWN; /* return now hands back the whole Value (number/string/list) — its exact kind isn't known statically; the redirect into float is backed up by rt_require_number, same as for map.get/file.read.text */
+        if (find_cfunc(&g_prog.c_funcs, m0)) return CT_UNKNOWN; /* an external C function: the same guarantee — it returns a Value, the type isn't known statically */
     }
     if (strcmp(m0, "math") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "count") == 0 && strcmp(call->a->items[2]->str, "equation") == 0)
@@ -938,38 +1215,43 @@ static CType call_return_type(Node *call) {
     if (strcmp(m0, "args") == 0 && call->a->item_count >= 2 && strcmp(call->a->items[1]->str, "count") == 0)
         return CT_FLOAT;
     if (strcmp(m0, "args") == 0 && call->a->item_count >= 2 && strcmp(call->a->items[1]->str, "get") == 0)
-        return CT_UNKNOWN; /* строка */
+        return CT_UNKNOWN; /* a string */
     if (strcmp(m0, "input") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "read") == 0 && strcmp(call->a->items[2]->str, "number") == 0)
         return CT_FLOAT;
     if (strcmp(m0, "input") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "read") == 0 && strcmp(call->a->items[2]->str, "text") == 0)
-        return CT_UNKNOWN; /* строка */
+        return CT_UNKNOWN; /* a string */
     if (strcmp(m0, "file") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "read") == 0 && strcmp(call->a->items[2]->str, "text") == 0)
-        return CT_UNKNOWN; /* строка */
+        return CT_UNKNOWN; /* a string */
     if (strcmp(m0, "file") == 0 && call->a->item_count >= 2 && strcmp(call->a->items[1]->str, "exists") == 0)
         return CT_FLOAT; /* 0/1 */
+    if (strcmp(m0, "resource") == 0 && call->a->item_count >= 3 &&
+        strcmp(call->a->items[1]->str, "load") == 0 && strcmp(call->a->items[2]->str, "text") == 0)
+        return CT_UNKNOWN; /* a string */
+    if (strcmp(m0, "resource") == 0 && call->a->item_count >= 2 && strcmp(call->a->items[1]->str, "extract") == 0)
+        return CT_UNKNOWN; /* a string (the extracted file's path) */
     if (strcmp(m0, "command") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "execute") == 0 && strcmp(call->a->items[2]->str, "show") == 0)
-        return CT_FLOAT; /* код завершения */
+        return CT_FLOAT; /* exit code */
     if (strcmp(m0, "command") == 0 && call->a->item_count >= 3 &&
         strcmp(call->a->items[1]->str, "execute") == 0 && strcmp(call->a->items[2]->str, "hidden") == 0)
-        return CT_UNKNOWN; /* строка (захваченный stdout) */
+        return CT_UNKNOWN; /* a string (captured stdout) */
     if (strcmp(m0, "map") == 0 && call->a->item_count >= 2 &&
         (strcmp(call->a->items[1]->str, "has") == 0 || strcmp(call->a->items[1]->str, "count") == 0))
         return CT_FLOAT;
     if (strcmp(m0, "map") == 0 && call->a->item_count >= 2 && strcmp(call->a->items[1]->str, "get") == 0)
-        return CT_UNKNOWN; /* значение может быть и числом, и текстом */
+        return CT_UNKNOWN; /* the value could be either a number or text */
     if (strcmp(m0, "str") == 0 && call->a->item_count >= 2 && strcmp(call->a->items[1]->str, "length") == 0)
         return CT_FLOAT;
     if (strcmp(m0, "str") == 0 && call->a->item_count >= 2 &&
         (strcmp(call->a->items[1]->str, "char_at") == 0 || strcmp(call->a->items[1]->str, "concat") == 0 || strcmp(call->a->items[1]->str, "substr") == 0))
-        return CT_UNKNOWN; /* строка */
+        return CT_UNKNOWN; /* a string */
     return CT_UNKNOWN;
 }
 
-/* ============================== Кодогенерация ============================== */
+/* ============================== Codegen ============================== */
 
 static FILE *g_out;
 /* Nesting depth of `loop repeat N` in the function currently being
@@ -1037,12 +1319,12 @@ static void gen_call(Node *n) {
             if (n->item_count != cf->arity)
                 compile_error(n->line, "'%s': external C function (declared '!c %s(%zu)') expects %zu argument(s), got %zu",
                               m0, m0, cf->arity, cf->arity, n->item_count);
-            /* Внешние C-функции берут и возвращают Value напрямую (тот же ABI,
-             * что и у STPL-функций) — поэтому просто зовём их по имени, без
-             * префикса fn_ и без rt_require_loaded: это не builtin-модуль за
-             * !export, а обычный C-идентификатор, который должен существовать
-             * в каком-нибудь из !c { ... } блоков (иначе это поймает сам gcc
-             * при финальной линковке). */
+            /* External C functions take and return a Value directly (the same
+             * ABI as STPL functions) — so we just call them by name, without the
+             * fn_ prefix and without rt_require_loaded: this isn't a builtin
+             * module behind !export, it's a plain C identifier that must exist
+             * in one of the !c { ... } blocks (otherwise gcc itself will catch
+             * it at the final link step). */
             fprintf(g_out, "%s(", m0);
             for (size_t i = 0; i < n->item_count; i++) {
                 if (i) fprintf(g_out, ", ");
@@ -1093,6 +1375,40 @@ static void gen_call(Node *n) {
             return;
         }
         compile_error(n->line, "unknown method of module display");
+    }
+    if (strcmp(m0, "resource") == 0) {
+        char *cid = c_ident("resource");
+        if (n->a->item_count >= 3 && strcmp(n->a->items[1]->str, "load") == 0 && strcmp(n->a->items[2]->str, "text") == 0) {
+            if (n->item_count != 1) compile_error(n->line, "resource.load.text expects exactly 1 argument");
+            if (n->items[0]->type != N_RESOURCE)
+                compile_error(n->line, "resource.load.text expects a file resource (e.g. data.txt) declared via !export");
+            if (!export_is_resource(n->items[0]->str))
+                compile_error(n->line, "resource '%s' is not imported (missing '!export %s')", n->items[0]->str, n->items[0]->str);
+            char *rcid = c_ident(n->items[0]->str);
+            fprintf(g_out, "({ rt_require_loaded(%d, mod_loaded_%s, \"resource\", \"module\"); "
+                            "rt_require_loaded(%d, mod_loaded_%s, \"%s\", \"resource\"); "
+                            "rt_resource_load_text(%d, \"%s\"); })",
+                    n->line, cid, n->line, rcid, n->items[0]->str, n->line, n->items[0]->str);
+            free(rcid);
+            free(cid);
+            return;
+        }
+        if (n->a->item_count >= 2 && strcmp(n->a->items[1]->str, "extract") == 0) {
+            if (n->item_count != 1) compile_error(n->line, "resource.extract expects exactly 1 argument");
+            if (n->items[0]->type != N_RESOURCE)
+                compile_error(n->line, "resource.extract expects a file resource (e.g. helper.bin) declared via !export");
+            if (!export_is_resource(n->items[0]->str))
+                compile_error(n->line, "resource '%s' is not imported (missing '!export %s')", n->items[0]->str, n->items[0]->str);
+            char *rcid = c_ident(n->items[0]->str);
+            fprintf(g_out, "({ rt_require_loaded(%d, mod_loaded_%s, \"resource\", \"module\"); "
+                            "rt_require_loaded(%d, mod_loaded_%s, \"%s\", \"resource\"); "
+                            "rt_resource_extract(%d, \"%s\"); })",
+                    n->line, cid, n->line, rcid, n->items[0]->str, n->line, n->items[0]->str);
+            free(rcid);
+            free(cid);
+            return;
+        }
+        compile_error(n->line, "unknown method of module resource");
     }
     if (strcmp(m0, "math") == 0) {
         if (n->a->item_count >= 3 && strcmp(n->a->items[1]->str, "count") == 0 && strcmp(n->a->items[2]->str, "equation") == 0) {
@@ -1380,20 +1696,20 @@ static void gen_expr(Node *n) {
             break;
         }
         case N_BINOP:
-            /* infer_expr_type рекурсивно проверяет оба операнда и сама
-             * бросает ошибку компиляции при несовпадении типов — вызываем
-             * её здесь, а не только в «внешних» точках (var decl/redirect/
-             * аргументы вызовов), иначе вложенная арифметика внутри других
-             * выражений могла бы проскочить без проверки. */
+            /* infer_expr_type recursively checks both operands and raises a
+             * compile error itself on a type mismatch — we call it here, not only
+             * at the "outer" points (var decl/redirect/call arguments), otherwise
+             * nested arithmetic inside other expressions could slip through
+             * unchecked. */
             infer_expr_type(n);
             if (strcmp(n->str, "<<") == 0 || strcmp(n->str, ">>") == 0 ||
                 strcmp(n->str, "&") == 0 || strcmp(n->str, "|") == 0 || strcmp(n->str, "^") == 0) {
-                /* Побитовые операции требуют целых операндов в C — здесь,
-                 * и только здесь, float честно приводится к (long long)
-                 * перед самой операцией и обратно к double после.
-                 * Приведение усечением к нулю (как обычный C-каст) —
-                 * тот же принцип "явно и предсказуемо", что и everywhere
-                 * else в языке. */
+                /* Bitwise operators require integer operands in C — right here,
+                 * and only here, a float is honestly cast to (long long)
+                 * right before the operation and back to double right after.
+                 * Truncating toward zero (an ordinary C cast) follows the
+                 * same "explicit and predictable" principle used everywhere
+                 * else in the language. */
                 fprintf(g_out, "rt_v_num((double)((long long)");
                 gen_numeric_subexpr(n->a);
                 fprintf(g_out, " %s (long long)", n->str);
@@ -1487,14 +1803,14 @@ static void gen_stmt(Node *n) {
             if (!vs) compile_error(n->line, "redirect into an undeclared variable '%s' (declare it with a type first)", n->str);
             const char *pfx = vs->owner_func ? "lv_" : "var_";
             if (vs->ctype == CT_FLOAT) {
-                /* Тип источника может быть статически известен (CT_FLOAT —
-                 * обычная арифметика) или нет (CT_UNKNOWN/CT_INT8 — вызовы
-                 * вроде map.get, file.read.text, command.execute.hidden,
-                 * значение которых заранее может оказаться и числом, и
-                 * текстом). Список (CT_INTLIST) — единственный случай,
-                 * который точно никогда не число, поэтому запрещаем его
-                 * сразу на компиляции; всё остальное пропускаем с честной
-                 * рантайм-проверкой (rt_require_number), а не тихим NaN. */
+                /* The source's type may be known statically (CT_FLOAT —
+                 * ordinary arithmetic) or not (CT_UNKNOWN/CT_INT8 — calls
+                 * like map.get, file.read.text, command.execute.hidden,
+                 * whose value could turn out to be either a number or
+                 * text). A list (CT_INTLIST) is the one case that's
+                 * certainly never a number, so it's rejected outright at
+                 * compile time; everything else is let through with an
+                 * honest runtime check (rt_require_number), not a silent NaN. */
                 CType st = infer_expr_type(n->a);
                 if (st == CT_INTLIST)
                     compile_error(n->line, "redirect into '%s' requires a numeric expression, not a list", n->str);
@@ -1512,16 +1828,16 @@ static void gen_stmt(Node *n) {
             } else if (vs->ctype == CT_INTLIST) {
                 if (vs->list_count != 1)
                     compile_error(n->line, "redirect into buffer '%s' requires it to be declared as a single-slot buffer, e.g. int(char=%g) %s = \"\"", n->str, vs->extra_num, n->str);
-                /* Буфер int(char=N): редирект в него принимает текстовый
-                 * результат (строку из другого builtin, например
-                 * command.execute.hidden) и складывает в первый (и
-                 * единственный, для случая буфера) элемент списка.
-                 * Ёмкость N — теперь ровно то, чем и должна быть: сколько
-                 * байт мы выделили под этот объект. Проверка длины —
-                 * рантайм-проверка (не compile-time, как для литералов),
-                 * потому что длина результата команды заранее не известна;
-                 * переполнение — честная rt_error, а не молчаливое
-                 * усечение. */
+                /* The int(char=N) buffer: redirecting into it accepts the text
+                 * result of another builtin (e.g. command.execute.hidden)
+                 * and stores it in the first (and, for the buffer case,
+                 * only) element of the list.
+                 * The capacity N is now exactly what it should be: how
+                 * many bytes we allocated for this object. The length
+                 * check is a runtime check (not compile-time, as for
+                 * literals), because the length of a command's result
+                 * isn't known ahead of time; an overflow is a proper
+                 * rt_error, never a silent truncation. */
                 if (infer_expr_type(n->a) == CT_FLOAT)
                     compile_error(n->line, "redirect into buffer '%s' (int(char=N)) requires a text-producing expression, not a number", n->str);
                 char *cid = c_ident(n->str);
@@ -1596,12 +1912,12 @@ static void gen_stmt(Node *n) {
             break;
         }
         case N_RETURN:
-            /* Раньше return был жёстко привязан к float (.num) — не по
-             * архитектурной необходимости, а просто по недосмотру: Value
-             * и так с самого начала умеет хранить число/строку/список.
-             * Теперь fn_%s возвращает Value целиком, так что return может
-             * отдать любое выражение как есть — то же самое, что делает
-             * gen_expr everywhere else в языке. */
+            /* return used to be hard-wired to float (.num) — not out of any
+             * architectural need, just an oversight: Value has been able to
+             * hold a number/string/list from the very start.
+             * Now fn_%s returns the whole Value, so return can
+             * hand back any expression as-is — the same thing
+             * gen_expr does everywhere else in the language. */
             fprintf(g_out, "return ");
             gen_expr(n->a);
             fprintf(g_out, ";\n");
@@ -1667,7 +1983,7 @@ static void generate(FILE *out) {
     }
     fprintf(out, "\n");
     for (VarSym *v = g_varsyms; v; v = v->next) {
-        if (v->owner_func) continue; /* локали функций с параметрами — не глобальные, объявляются внутри тела fn_%s */
+        if (v->owner_func) continue; /* locals of functions with parameters — not global, declared inside the body of fn_%s */
         char *cid = c_ident(v->name);
         fprintf(out, "static Value var_%s __attribute__((unused));\nstatic int var_%s_loaded __attribute__((unused)) = 0;\n", cid, cid);
         free(cid);
@@ -1689,19 +2005,19 @@ static void generate(FILE *out) {
         gen_param_list(f);
         fprintf(out, ") {\n");
         if (f->has_cpu) {
-            /* Привязка к ядру — ПЕРВАЯ инструкция тела функции, единая
-             * точка через рантайм (rt_pin_to_cpu). Не зависит от того,
-             * вызвана ли fn_%s напрямую из main(), из pthread-обёртки
-             * верхнеуровневого start, или через `start` внутри блока —
-             * везде это одна и та же гарантия. */
+            /* Core pinning — the FIRST instruction of the function body, a
+             * single entry point through the runtime (rt_pin_to_cpu). It
+             * doesn't matter whether fn_%s is called directly from main(),
+             * from the pthread wrapper of a top-level start, or via a
+             * `start` inside a block — the guarantee is the same everywhere. */
             fprintf(out, "  rt_pin_to_cpu(%d, %d);\n", f->line, f->cpu);
         }
         if (f->param_count > 0) {
-            /* Настоящие C-локали этой функции — свежий набор на каждый
-             * вызов (обычный C-стек), а не общие глобальные слоты. Именно
-             * это и даёт честную рекурсию: два "одновременно висящих"
-             * вызова одной и той же функции (например, при f(a) и f(b) в
-             * одном кадре) больше не затирают данные друг друга. */
+            /* This function's genuine C locals — a fresh set on every
+             * call (an ordinary C stack), not shared global slots. This is
+             * exactly what gives honest recursion: two "simultaneously
+             * pending" calls to the same function (e.g. from f(a) and
+             * f(b) in one frame) no longer stomp on each other's data. */
             for (VarSym *v = g_varsyms; v; v = v->next) {
                 if (v->owner_func && strcmp(v->owner_func, f->name) == 0) {
                     char *vcid = c_ident(v->name);
@@ -1714,18 +2030,18 @@ static void generate(FILE *out) {
         g_cur_func = f;
         gen_block(f->body);
         g_cur_func = NULL;
-        /* "Доехать до конца функции, ни разу не встретив return" — это
-         * не ошибка, а давно устоявшееся, задокументированное поведение
-         * языка: неявный успех, код 0. Именно rt_v_num(0), а не
-         * rt_v_nil() — иначе верхнеуровневые start без явного return в
-         * самом конце (обычный, распространённый стиль — см. calculator.stpl)
-         * ловили бы честную, но неожиданную rt_require_number-ошибку на
-         * ровном месте вместо привычного "тихого нуля". */
+        /* "Reaching the end of a function without ever hitting a return" is
+         * not an error, it's long-standing, documented language behavior:
+         * implicit success, exit code 0. It's rt_v_num(0) specifically, not
+         * rt_v_nil() — otherwise top-level starts with no explicit return
+         * at the very end (a common, ordinary style — see calculator.stpl)
+         * would hit an honest but unexpected rt_require_number error out of
+         * nowhere, instead of the familiar "silent zero". */
         fprintf(out, "  return rt_v_num(0);\n}\n\n");
         free(cid);
     }
 
-    /* потоковые обёртки для верхнеуровневых start (параллельные задачи) */
+    /* thread wrappers for top-level starts (parallel tasks) */
     if (g_prog.top_starts.count > 1) {
         for (size_t i = 0; i < g_prog.top_starts.count; i++) {
             char *name = g_prog.top_starts.items[i];
@@ -1740,10 +2056,10 @@ static void generate(FILE *out) {
     fprintf(out, "  rt_args_init(argc, argv);\n");
     if (g_prog.top_starts.count == 1) {
         char *cid = c_ident(g_prog.top_starts.items[0]);
-        /* Единственное место, где Value обязана стать числом: код
-         * возврата процесса ОС принимает только число, третьего не дано.
-         * rt_require_number честно падает, если верхнеуровневый return
-         * почему-то оказался строкой, а не тихо подставляет 0. */
+        /* The one place where a Value must become a number: the OS
+         * process exit code only accepts a number, there's no third option.
+         * rt_require_number honestly fails if a top-level return
+         * somehow turned out to be a string, instead of silently defaulting to 0. */
         fprintf(out, "  return (int)rt_require_number(0, fn_%s(), \"program exit code\").num;\n", cid);
         free(cid);
     } else {
@@ -1763,7 +2079,7 @@ static void generate(FILE *out) {
     fprintf(out, "}\n");
 }
 
-/* ============================== Встраивание ресурсов ============================== */
+/* ============================== Resource embedding ============================== */
 
 static void wr_u32(FILE *f, unsigned int v) {
     unsigned char b[4] = { v & 0xff, (v>>8)&0xff, (v>>16)&0xff, (v>>24)&0xff };
@@ -1824,14 +2140,6 @@ static void embed_resources(const char *binpath) {
 
 /* ============================== main ============================== */
 
-static char *dirname_of(const char *path) {
-    char *cp = strdup(path);
-    char *slash = strrchr(cp, '/');
-    if (!slash) { free(cp); return strdup("."); }
-    *slash = '\0';
-    return cp;
-}
-
 static char *self_exe_dir(void) {
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf)-1);
@@ -1872,7 +2180,14 @@ int main(int argc, char **argv) {
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     char *src = malloc(sz+1); size_t rd = fread(src,1,sz,f); src[rd]='\0'; fclose(f);
 
-    TokList tl = lex(src);
+    char *main_resolved = realpath(srcpath, NULL);
+    g_main_resolved_file = main_resolved ? main_resolved : srcpath;
+    str_push(&g_use_stack, (char *)g_main_resolved_file);
+
+    TokList tl = {0};
+    lex_into(src, g_main_resolved_file, &tl);
+    Tok eof = {TK_EOF, NULL, 0, 0, NULL};
+    tok_push(&tl, eof);
     g_prog = parse_program(&tl);
 
     if (g_prog.top_starts.count == 0) compile_error(0, "no 'start' at the top level of the file");
@@ -1889,8 +2204,60 @@ int main(int argc, char **argv) {
         collect_decls_block(f->body, f->param_count > 0 ? f->name : NULL);
     }
 
+    /* "exit is mandatory": every builtin module or resource actually used
+     * anywhere in the program, and every variable declared in a
+     * zero-parameter function, must be `exit`ed somewhere in the program.
+     * This check is program-wide, not per-function, and that's not a
+     * simplification — it matches what the storage actually is. A
+     * zero-parameter function's locals are shared global slots keyed only
+     * by name (see varsym_add: two zero-parameter functions declaring the
+     * same-named, same-typed variable silently alias to ONE slot), so
+     * "exited somewhere in the program" is the honest guarantee, not
+     * "exited in the same function" — and the language leans on this
+     * directly: examples/logic.stpl declares `result` in logic() but only
+     * exits it from print(), reached via a `start print` tail-jump out of
+     * logic(); examples/fibonacci.stpl exits `logic` from main() even
+     * though the only `if` that needs it is inside fib(). A parameterized
+     * function's locals are real per-call stack locals (freed by the C
+     * stack itself) and are exempt entirely — same as fib()'s own
+     * n1/n2/a/b never being exited anywhere in examples/fibonacci.stpl. */
+    {
+        StrList prog_used = {0}, prog_declared = {0}, prog_exited = {0};
+        for (size_t i = 0; i < g_prog.funcs.count; i++) {
+            FuncDef *f = &g_prog.funcs.items[i];
+            StrList declared_here = {0}, used_here = {0}, exited_here = {0};
+            collect_lifecycle(f->body, &used_here, &declared_here, &exited_here);
+            for (size_t j = 0; j < used_here.count; j++)
+                if (!str_list_contains(&prog_used, used_here.items[j])) str_push(&prog_used, strdup(used_here.items[j]));
+            if (f->param_count == 0) {
+                for (size_t j = 0; j < declared_here.count; j++)
+                    if (!str_list_contains(&prog_declared, declared_here.items[j])) str_push(&prog_declared, strdup(declared_here.items[j]));
+            }
+            for (size_t j = 0; j < exited_here.count; j++)
+                if (!str_list_contains(&prog_exited, exited_here.items[j])) str_push(&prog_exited, strdup(exited_here.items[j]));
+        }
+        for (size_t i = 0; i < prog_used.count; i++) {
+            if (!str_list_contains(&prog_exited, prog_used.items[i]))
+                compile_error(0, "'%s' is used but never exit'd anywhere in the program — exit is mandatory, add 'exit %s' somewhere before the program (or the thread using it) finishes",
+                              prog_used.items[i], prog_used.items[i]);
+        }
+        for (size_t i = 0; i < prog_declared.count; i++) {
+            if (!str_list_contains(&prog_exited, prog_declared.items[i]))
+                compile_error(0, "variable '%s' is declared but never exit'd anywhere in the program — exit is mandatory, add 'exit %s' somewhere before the program (or the thread using it) finishes",
+                              prog_declared.items[i], prog_declared.items[i]);
+        }
+    }
+
+    /* The generated .c goes to /tmp, not next to the output binary — it's a
+     * build artifact the user doesn't need to see (or accidentally ship).
+     * PID in the name keeps two concurrent/successive builds of a
+     * same-named binary from clobbering each other's intermediate file. */
     char genc_path[4200];
-    snprintf(genc_path, sizeof(genc_path), "%s.gen.c", outpath);
+    {
+        const char *base = strrchr(outpath, '/');
+        base = base ? base + 1 : outpath;
+        snprintf(genc_path, sizeof(genc_path), "/tmp/%s.%d.gen.c", base, (int)getpid());
+    }
     FILE *out = fopen(genc_path, "wb");
     if (!out) { fprintf(stderr, "STPL: cannot create '%s'\n", genc_path); return 1; }
     generate(out);
@@ -1903,14 +2270,32 @@ int main(int argc, char **argv) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        /* -lm — так, чтобы <math.h>-функции внутри !c { ... } блоков (sqrt,
-         * hypot, pow, ...) линковались из коробки, без отдельной директивы.
-         * Полноценная поддержка произвольных внешних библиотек (-l/-L из
-         * самого STPL-исходника) — отдельная фича, здесь сознательно не
-         * делается: !c даёт только вкрапление/использование C, которое уже
-         * доступно через libc/libm/libpthread. */
-        execlp("gcc", "gcc", "-std=gnu11", "-Wall", "-Wextra", "-O2",
-               "-I", rt_h_dir, "-o", outpath, genc_path, rt_c, "-lpthread", "-lm", (char*)NULL);
+        /* -lm/-lpthread — so libc/libm/libpthread functions inside !c { ... }
+         * blocks (sqrt, hypot, pow, pthread_*, ...) link out of the box,
+         * without a separate directive. Anything beyond that — SDL2,
+         * libcurl, any other system C library — comes from g_link_flags,
+         * built up over the whole source by !link/!pkgconfig directives
+         * (see the lexer's '!' dispatch) and appended here in source order. */
+        size_t base_argc = 13; /* "gcc" .. "-lm", counted below, kept in sync with the fixed args pushed */
+        size_t total = base_argc + g_link_flags.count + 1; /* +1 for NULL terminator */
+        char **argv_gcc = malloc(total * sizeof(char*));
+        size_t ai = 0;
+        argv_gcc[ai++] = (char*)"gcc";
+        argv_gcc[ai++] = (char*)"-std=gnu11";
+        argv_gcc[ai++] = (char*)"-Wall";
+        argv_gcc[ai++] = (char*)"-Wextra";
+        argv_gcc[ai++] = (char*)"-O2";
+        argv_gcc[ai++] = (char*)"-I";
+        argv_gcc[ai++] = rt_h_dir;
+        argv_gcc[ai++] = (char*)"-o";
+        argv_gcc[ai++] = (char*)outpath;
+        argv_gcc[ai++] = genc_path;
+        argv_gcc[ai++] = rt_c;
+        argv_gcc[ai++] = (char*)"-lpthread";
+        argv_gcc[ai++] = (char*)"-lm";
+        for (size_t i = 0; i < g_link_flags.count; i++) argv_gcc[ai++] = g_link_flags.items[i];
+        argv_gcc[ai] = NULL;
+        execvp("gcc", argv_gcc);
         fprintf(stderr, "STPL: failed to launch gcc\n");
         _exit(127);
     }

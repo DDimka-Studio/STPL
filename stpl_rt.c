@@ -9,23 +9,24 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
-/* Закрепление потока за конкретным физическим ядром. Раньше использовался
- * pthread_setaffinity_np() — это расширение glibc, которого нет (или оно
- * появилось лишь в самых последних версиях) в bionic — библиотеке
- * Android/Termux. А это одна из реальных целевых платформ разработки.
- * Правильный портируемый вариант — sched_setaffinity() напрямую: это
- * более старый, более низкоуровневый интерфейс поверх того же самого
- * системного вызова ядра Linux, и он есть и в glibc, и в bionic (в
- * bionic — начиная с Android API 14, то есть фактически везде). Именно
- * его официально рекомендует сама документация Android NDK вместо
- * pthread_setaffinity_np(). Это работает на любой системе с ядром
- * Linux (обычные дистрибутивы и Termux/Android), но не на платформах
- * без ядра Linux вообще (macOS, BSD) — для них ниже оставлен явный,
- * громкий отказ вместо падения сборки или молчаливой лжи.
- * Наличие API определяется один раз, здесь, единственное место, которое
- * нужно трогать при добавлении поддержки новой платформы в будущем. */
+/* Pins the thread to a specific physical core. This used to rely on
+ * pthread_setaffinity_np() — a glibc extension missing (or only
+ * available in the very latest versions) from bionic, the C library
+ * used by Android/Termux, which is one of this project's real target
+ * platforms.
+ * The correct, portable choice is sched_setaffinity() directly: an
+ * older, lower-level interface over the exact same Linux kernel
+ * syscall, present in both glibc and bionic (in bionic, since Android
+ * API 14 — i.e. essentially everywhere). It's exactly what the
+ * Android NDK's own documentation officially recommends instead of
+ * pthread_setaffinity_np(). This works on any system running a Linux
+ * kernel (ordinary distros and Termux/Android), but not on platforms
+ * with no Linux kernel at all (macOS, BSD) — for those, an explicit,
+ * loud refusal is left below rather than a broken build or a quiet lie.
+ * Availability of the API is decided once, here — the single place that needs touching when support for a new platform is added later. */
 #if defined(__linux__)
 #  define STPL_HAVE_CPU_AFFINITY 1
 #  include <sched.h>
@@ -63,14 +64,14 @@ static const char *v_as_cstr(Value v, char *buf, size_t buflen) {
         else snprintf(buf, buflen, "%g", v.num);
         return buf;
     }
-    /* Однослотовый буфер int(char=N) хранится как V_LIST из одного
-     * элемента (см. компилятор, N_REDIRECT/gen_var_decl) — разворачиваем
-     * его рекурсивно, чтобы file/command/map/str честно видели его как
-     * обычный текст, а не молча получали "" (как было раньше — реальный
-     * баг, из-за которого str.length() на int(char=N)-буфере тихо давал 0
-     * вместо длины строки). Список из НЕСКОЛЬКИХ элементов (обычный
-     * литерал через запятую) сюда не подходит по смыслу — там неясно,
-     * какой из элементов брать, так что для него по-прежнему "". */
+    /* The single-slot int(char=N) buffer is stored as a V_LIST with one
+     * element (see the compiler, N_REDIRECT/gen_var_decl) — we unwrap it
+     * recursively here so file/command/map/str genuinely see it as plain
+     * text instead of silently getting "" (as used to happen — a real bug
+     * that made str.length() on an int(char=N) buffer silently return 0
+     * instead of the string's length). A list of SEVERAL elements (an
+     * ordinary comma-separated literal) doesn't make sense here — it's
+     * unclear which element to take, so it still gets "" in that case. */
     if (v.type == V_LIST && v.list_count == 1) return v_as_cstr(v.list[0], buf, buflen);
     return "";
 }
@@ -97,7 +98,7 @@ void rt_require_loaded(int line, int loaded_flag, const char *name, const char *
 
 void rt_pin_to_cpu(int line, int cpu_index) {
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nproc <= 0) nproc = 1; /* не смогли узнать — считаем, что ядро одно */
+    if (nproc <= 0) nproc = 1; /* couldn't determine it — assume a single core */
 
     if (cpu_index < 0 || cpu_index >= nproc) {
         char buf[256];
@@ -112,10 +113,10 @@ void rt_pin_to_cpu(int line, int cpu_index) {
     CPU_ZERO(&set);
     CPU_SET((size_t)cpu_index, &set);
 
-    /* pid=0 в sched_setaffinity() значит "текущий поток" (Linux/bionic
-     * трактуют потоки как облегчённые процессы с общим PID-namespace —
-     * это тот же самый системный вызов, которым под капотом является
-     * pthread_setaffinity_np, просто без глибц-обёртки поверх него). */
+    /* pid=0 in sched_setaffinity() means "the current thread" (Linux/bionic
+     * treat threads as lightweight processes sharing a PID namespace — this
+     * is the very same syscall that pthread_setaffinity_np() wraps under the
+     * hood, just without the glibc wrapper on top of it). */
     int rc = sched_setaffinity(0, sizeof(set), &set);
     if (rc != 0) {
         char buf[256];
@@ -125,15 +126,15 @@ void rt_pin_to_cpu(int line, int cpu_index) {
         rt_error(line, buf);
     }
 #else
-    /* Платформа без ядра Linux (например, macOS/BSD) — sched_setaffinity
-     * в том виде, в каком он тут используется, недоступен. Индекс ядра
-     * уже проверен на разумность выше, но саму привязку выполнить
-     * нечем. Молчать тут нельзя — по духу языка это было бы ложью:
-     * разработчик явно попросил конкретное ядро, а получит "как
-     * получится". Поэтому громко и явно говорим, что на этой
-     * платформе `cpu N` не поддерживается, вместо того чтобы либо не
-     * собраться вовсе (как было раньше), либо тихо проигнорировать
-     * привязку. */
+    /* A platform with no Linux kernel (e.g. macOS/BSD) — sched_setaffinity,
+     * used the way it is here, isn't available. The core index has already
+     * been sanity-checked above, but there is nothing to actually perform
+     * the pinning with. Staying silent here would go against the spirit of
+     * the language: the developer explicitly asked for a specific core and
+     * would get "whatever happens" instead. So we loudly and explicitly say
+     * that `cpu N` isn't supported on this platform, instead of either
+     * failing to build at all (as it used to) or silently ignoring the
+     * pinning request. */
     (void)cpu_index;
     rt_error(line, "cpu N: pinning a thread to a core is not supported on this platform "
                     "(a Linux kernel is required — a regular distro or Termux/Android; "
@@ -147,10 +148,10 @@ Value rt_display_show_text(Value v) {
     return rt_v_nil();
 }
 
-/* display.show.text::stderr(...) — тот же вывод, но в stderr вместо
- * stdout. Имя потока проверяется компилятором статически (stdout/
- * stderr — единственные два известных значения); сюда попадает уже
- * только валидный флаг, посчитанный на этапе компиляции. */
+/* display.show.text::stderr(...) — the same output, but to stderr
+ * instead of stdout. The stream name is checked statically by the
+ * compiler (stdout/stderr are the only two known values); only an
+ * already-valid flag, computed at compile time, ever reaches here. */
 Value rt_display_show_text_to(Value v, int to_stderr) {
     FILE *out = to_stderr ? stderr : stdout;
     rt_v_fprint(out, v);
@@ -170,10 +171,10 @@ Value rt_display_show_image(const char *resource_name) {
 }
 
 Value rt_math_count_equation(Value v) {
-    return v; /* заготовка: выражение уже посчитано генератором кода */
+    return v; /* placeholder: the expression has already been evaluated by the codegen */
 }
 
-/* ============================ sleep (уступка CPU) =========================== */
+/* ============================ sleep (yielding the CPU) =========================== */
 
 Value rt_sleep_ms(int line, Value ms) {
     if (ms.type != V_NUM)
@@ -183,13 +184,13 @@ Value rt_sleep_ms(int line, Value ms) {
     struct timespec ts;
     ts.tv_sec = (time_t)(ms.num / 1000.0);
     ts.tv_nsec = (long)((ms.num - (double)ts.tv_sec * 1000.0) * 1000000.0);
-    /* nanosleep может прерваться сигналом раньше времени — досыпаем остаток,
-     * чтобы вызов честно спал запрошенное время, а не "как получится". */
+    /* nanosleep can be interrupted early by a signal — sleep out the
+     * remainder, so the call genuinely sleeps the requested time instead of "whatever happens". */
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
     return rt_v_nil();
 }
 
-/* ============================ args (argv компилируемой программы) ========== */
+/* ============================ args (argv of the compiled program) ========== */
 
 static int g_argc = 0;
 static char **g_argv = NULL;
@@ -200,8 +201,8 @@ void rt_args_init(int argc, char **argv) {
 }
 
 Value rt_args_count(void) {
-    /* argv[0] — имя самой программы, пользователю STPL это неинтересно,
-     * считаем только реальные аргументы после него. */
+    /* argv[0] is the program's own name — STPL users have no interest in
+     * that, so we only count the real arguments after it. */
     int n = g_argc > 0 ? g_argc - 1 : 0;
     return rt_v_num(n);
 }
@@ -212,22 +213,25 @@ Value rt_args_get(int line, Value idx) {
     long n = g_argc > 0 ? g_argc - 1 : 0;
     if (i < 0 || i >= n) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "args.get(%ld): no such argument (available: 0..%ld)", i, n - 1);
+        if (n == 0)
+            snprintf(buf, sizeof(buf), "args.get(%ld): no such argument (no arguments were passed to this program)", i);
+        else
+            snprintf(buf, sizeof(buf), "args.get(%ld): no such argument (available: 0..%ld)", i, n - 1);
         rt_error(line, buf);
     }
-    /* +1: пропускаем argv[0] (имя программы) — args.get(0) это первый
-     * реальный аргумент пользователя. */
+        /* +1: skip argv[0] (the program name) — args.get(0) is the first
+         * real argument from the user. */
     return rt_v_str(g_argv[i + 1]);
 }
 
-/* ============================ input (чтение текста из stdin) =============== */
+/* ============================ input (reading text from stdin) =============== */
 
 Value rt_input_read_text(void) {
     char *line = NULL;
     size_t cap = 0;
     ssize_t len = getline(&line, &cap, stdin);
-    if (len < 0) { free(line); return rt_v_str(""); } /* EOF или ошибка чтения — пустая строка */
-    /* срезаем завершающие \n и, если был, \r перед ним (CRLF) */
+    if (len < 0) { free(line); return rt_v_str(""); } /* EOF or a read error — empty string */
+    /* trims the trailing \n and, if present, the \r before it (CRLF) */
     if (len > 0 && line[len - 1] == '\n') { line[len - 1] = '\0'; len--; }
     if (len > 0 && line[len - 1] == '\r') { line[len - 1] = '\0'; }
     Value v = rt_v_str(line);
@@ -282,7 +286,7 @@ Value rt_file_read_text(int line, Value path) {
 Value rt_file_write_text(int line, Value path, Value content) {
     char pbuf[512];
     const char *p = v_as_cstr(path, pbuf, sizeof(pbuf));
-    char cbuf[64]; /* только для числового content — строка не усечётся, см. v_as_cstr */
+    char cbuf[64]; /* only for numeric content — the string never gets truncated, see v_as_cstr */
     const char *c = v_as_cstr(content, cbuf, sizeof(cbuf));
     FILE *f = fopen(p, "wb");
     if (!f) {
@@ -355,7 +359,7 @@ Value rt_require_number(int line, Value v, const char *target_name) {
     return v;
 }
 
-/* ============================ command (внешние процессы) ==================== */
+/* ============================ command (external processes) ==================== */
 
 Value rt_command_execute_show(int line, Value shell, Value command) {
     char sbuf[256], cbuf[64];
@@ -369,10 +373,10 @@ Value rt_command_execute_show(int line, Value shell, Value command) {
         rt_error(line, buf);
     }
     if (pid == 0) {
-        /* Ничего не перенаправляем — ребёнок наследует stdin/stdout/stderr
-         * текущего терминала как есть, ровно как при ручном запуске. */
+        /* We redirect nothing — the child inherits stdin/stdout/stderr from
+         * the current terminal as-is, exactly like a manual run would. */
         execlp(sh, sh, "-c", cmd, (char *)NULL);
-        _exit(127); /* exec не удался (shell не найден и т.п.) */
+        _exit(127); /* exec failed (shell not found, etc.) */
     }
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
@@ -402,10 +406,10 @@ Value rt_command_execute_hidden(int line, Value shell, Value command) {
         rt_error(line, buf);
     }
     if (pid == 0) {
-        /* Скрытый режим: ничего не должно просочиться в реальный терминал.
-         * stdout ребёнка -> наша труба (чтобы забрать вывод в буфер);
-         * stdin и stderr -> /dev/null, чтобы команда не подвисла в
-         * ожидании ввода с терминала и не напечатала ничего мимо нас. */
+        /* Hidden mode: nothing must leak into the real terminal.
+         * The child's stdout -> our pipe (to capture the output into the
+         * buffer); stdin and stderr -> /dev/null, so the command doesn't hang
+         * waiting for terminal input and doesn't print anything past us. */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         int devnull = open("/dev/null", O_RDWR);
@@ -444,18 +448,18 @@ Value rt_command_execute_hidden(int line, Value shell, Value command) {
 }
 
 /* ============================ Embedded resources ============================
- * Формат хвоста бинарника (см. компилятор, функция embed_resources):
+ * Binary tail format (see the compiler, function embed_resources):
  *
- *   [оригинальный бинарник]
- *   [resource bytes...]                (конкатенация всех ресурсов)
- *   [TOC entries...]                    для каждого: u32 name_len, name,
+ *   [original binary]
+ *   [resource bytes...]                (concatenation of all resources)
+ *   [TOC entries...]                    for each: u32 name_len, name,
  *                                        u64 data_offset, u64 data_len
- *   [footer, 20 байт]:
- *       u64 toc_offset (абсолютный offset начала TOC)
+ *   [footer, 20 bytes]:
+ *       u64 toc_offset (absolute offset of the TOC's start)
  *       u32 toc_count
- *       8 байт magic "STPLRES1"
+ *       8-byte magic "STPLRES1"
  *
- * Если magic не совпал — ресурсов нет (обычный бинарник без embedding).
+ * If the magic doesn't match — there are no resources (a plain binary, no embedding).
  */
 
 static void rd_u32(FILE *f, unsigned int *out) {
@@ -514,10 +518,85 @@ const unsigned char *rt_resource_load(const char *name, size_t *out_len) {
     return NULL;
 }
 
-/* Семантика (как в интерпретаторе stpl2.c, eval_cond):
- *   ==  : левое равно ХОТЯ БЫ одному значению из списка справа.
- *   !=  : левое не равно НИ ОДНОМУ значению из списка (отличается от всех).
- *   <=, >=, <  : сравнение только для чисел (V_NUM), ХОТЯ БЫ с одним из списка. */
+/* resource.load.text(name) — reads an embedded resource straight into a
+ * string, the same way file.read.text does for a real file on disk. Meant
+ * for text resources; embedded NUL bytes truncate the string early, same
+ * as any other place a Value's .str is used as a plain C string. */
+Value rt_resource_load_text(int line, const char *name) {
+    size_t len = 0;
+    const unsigned char *data = rt_resource_load(name, &len);
+    if (!data) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "resource.load.text: '%s' is not embedded in this binary", name);
+        rt_error(line, buf);
+    }
+    char *out = malloc(len + 1);
+    memcpy(out, data, len);
+    out[len] = '\0';
+    free((void *)data);
+    Value v = rt_v_str(out);
+    free(out);
+    return v;
+}
+
+/* resource.extract(name) — writes an embedded resource out to a real,
+ * uniquely-named file under /tmp and hands back its path as a string, so
+ * the program can do anything a real file allows with it — read it with
+ * `file`, or, the actual reason this exists: run it with `command.execute`,
+ * e.g. an embedded helper binary or script that was baked into this binary
+ * via !export.
+ * The file is marked executable (chmod 0700) unconditionally: there's no
+ * static way to know ahead of time whether a given resource is meant to be
+ * run, and the bit is harmless on a resource that isn't. The file is
+ * deliberately NOT deleted automatically afterward — same "explicit, not
+ * magic" principle as the rest of the runtime: STPL does not silently
+ * manage temp files behind the program's back; if the caller wants it
+ * gone, that's a plain `command.execute` of `rm`, same as anything else. */
+Value rt_resource_extract(int line, const char *name) {
+    size_t len = 0;
+    const unsigned char *data = rt_resource_load(name, &len);
+    if (!data) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "resource.extract: '%s' is not embedded in this binary", name);
+        rt_error(line, buf);
+    }
+    char path[] = "/tmp/stpl_res_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        free((void *)data);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "resource.extract: cannot create a temp file for '%s' (%s)", name, strerror(errno));
+        rt_error(line, buf);
+    }
+    size_t written = 0;
+    int write_failed = 0;
+    while (written < len) {
+        ssize_t w = write(fd, data + written, len - written);
+        if (w < 0) { write_failed = 1; break; }
+        written += (size_t)w;
+    }
+    close(fd);
+    if (write_failed) {
+        free((void *)data);
+        unlink(path);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "resource.extract: write failed for '%s' (%s)", name, strerror(errno));
+        rt_error(line, buf);
+    }
+    if (chmod(path, 0700) != 0) {
+        free((void *)data);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "resource.extract: chmod failed for '%s' (%s)", name, strerror(errno));
+        rt_error(line, buf);
+    }
+    free((void *)data);
+    return rt_v_str(path);
+}
+
+/* Semantics (same as in the interpreter stpl2.c, eval_cond):
+ *   ==  : the left side equals AT LEAST ONE value from the list on the right.
+ *   !=  : the left side equals NONE of the values in the list (differs from all of them).
+ *   <=, >=, <  : comparison only for numbers (V_NUM), against AT LEAST ONE from the list. */
 int rt_cond_eval(const char *op, Value left, Value *right, int right_count) {
     int any_eq = 0, any_le = 0, any_ge = 0, any_lt = 0;
     for (int i = 0; i < right_count; i++) {
@@ -537,7 +616,7 @@ int rt_cond_eval(const char *op, Value left, Value *right, int right_count) {
     return 0;
 }
 
-/* ============================ map (именованные хэш-таблицы) ================= */
+/* ============================ map (named hash tables) ================= */
 
 typedef struct MapEntry { Value key; Value value; struct MapEntry *next; } MapEntry;
 typedef struct MapTable { char *name; MapEntry *entries; struct MapTable *next; } MapTable;
@@ -546,7 +625,7 @@ static MapTable *g_maps = NULL;
 static Value value_dup(Value v) {
     Value r = v;
     if (v.type == V_STR) r.str = v.str ? strdup(v.str) : NULL;
-    /* map намеренно не хранит V_LIST — см. проверку в rt_map_set. */
+    /* map deliberately never stores a V_LIST — see the check in rt_map_set. */
     return r;
 }
 
@@ -642,7 +721,7 @@ Value rt_map_count(Value map_name) {
     return rt_v_num(n);
 }
 
-/* ============================ str (строки как данные) ======================= */
+/* ============================ str (strings as data) ======================= */
 
 Value rt_str_length(Value s) {
     char buf[64];
@@ -699,15 +778,15 @@ Value rt_str_substr(int line, Value s, Value start, Value len) {
     return v;
 }
 
-/* ============================ sync (именованные мьютексы) =================== */
+/* ============================ sync (named mutexes) =================== */
 
 typedef struct SyncEntry { char *name; pthread_mutex_t mutex; struct SyncEntry *next; } SyncEntry;
 static SyncEntry *g_sync_mutexes = NULL;
-/* Мьютекс, защищающий саму связку g_sync_mutexes — создание НОВОЙ
- * записи в реестре именованных мьютексов должно быть атомарным
- * относительно других потоков, иначе два потока могли бы одновременно
- * решить, что мьютекса "foo" ещё нет, и создать две разные копии —
- * ровно та гонка данных, от которой sync должен защищать. */
+/* The mutex protecting the g_sync_mutexes registry itself — creating a
+ * NEW entry in the named-mutex registry must be atomic with respect to
+ * other threads, otherwise two threads could simultaneously decide that
+ * mutex "foo" doesn't exist yet and create two separate copies of it —
+ * exactly the data race that sync is supposed to protect against. */
 static pthread_mutex_t g_sync_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static SyncEntry *sync_find_or_create(const char *name) {
@@ -718,11 +797,11 @@ static SyncEntry *sync_find_or_create(const char *name) {
     if (!e) {
         e = malloc(sizeof(SyncEntry));
         e->name = strdup(name);
-        /* PTHREAD_MUTEX_ERRORCHECK, не обычный мьютекс по умолчанию:
-         * обычный тип даёт undefined behavior на double-unlock или
-         * unlock чужим потоком — не то, на чём можно строить честную
-         * rt_error. Errorcheck-мьютекс гарантированно возвращает EPERM
-         * в этих случаях вместо непредсказуемого поведения. */
+        /* PTHREAD_MUTEX_ERRORCHECK, not the default plain mutex type: the
+         * default type gives undefined behavior on a double-unlock or an
+         * unlock from another thread — not something a proper rt_error can
+         * be built on. An errorcheck mutex reliably returns EPERM in those
+         * cases instead of unpredictable behavior. */
         pthread_mutexattr_t attr;
         pthread_mutexattr_init(&attr);
         pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
@@ -755,9 +834,9 @@ Value rt_sync_unlock(int line, Value name) {
     int rc = pthread_mutex_unlock(&e->mutex);
     if (rc != 0) {
         char buf[256];
-        /* Самая частая причина — unlock мьютекса, который этот же поток
-         * не держал (или двойной unlock). pthread не позволяет разрулить
-         * это красиво сама, поэтому явно называем причину в сообщении. */
+        /* The most common cause is unlocking a mutex that this same thread
+         * never held (or a double unlock). pthread itself gives no clean way
+         * to tell these apart, so we name the likely cause explicitly in the message. */
         snprintf(buf, sizeof(buf), "sync.unlock('%s'): pthread_mutex_unlock failed (%s) — most likely this thread never locked it, or it was already unlocked", nm, strerror(rc));
         rt_error(line, buf);
     }

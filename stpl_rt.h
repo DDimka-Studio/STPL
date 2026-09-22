@@ -1,6 +1,6 @@
-/* STPL runtime — линкуется со сгенерированным C-кодом.
- * Реализует встроенные модули (display, math, logic-компаратор) и
- * настоящее lazy-embedding файлов-ресурсов из хвоста исполняемого файла.
+/* STPL runtime — links with the generated C code.
+ * Implements the builtin modules (display, math, logic comparator) and
+ * genuine lazy embedding of resource files from the tail of the executable.
  */
 #ifndef STPL_RT_H
 #define STPL_RT_H
@@ -13,8 +13,8 @@ typedef enum { V_NIL, V_NUM, V_STR, V_LIST } VType;
 typedef struct Value {
     VType type;
     double num;
-    char *str;              /* malloc'd, может быть NULL */
-    struct Value *list;      /* malloc'd массив, может быть NULL */
+    char *str;              /* malloc'd, may be NULL */
+    struct Value *list;      /* malloc'd array, may be NULL */
     size_t list_count;
 } Value;
 
@@ -26,52 +26,52 @@ void  rt_v_fprint(FILE *out, Value v);
 int   rt_values_equal(Value a, Value b);
 int rt_cond_eval(const char *op, Value left, Value *right, int right_count);
 
-/* Ошибка выполнения — печатает сообщение и завершает процесс (код 1). */
+/* Runtime error — prints a message and terminates the process (exit code 1). */
 void rt_error(int line, const char *msg) __attribute__((noreturn));
 
-/* Закрепление ТЕКУЩЕГО потока за физическим ядром cpu_index (нумерация с 0).
- * Единая точка входа для codegen: вызывается как первая инструкция внутри
- * тела функции, объявленной с `cpu N`, — независимо от того, как эта
- * функция вызвана (напрямую из main, из pthread-обёртки верхнеуровневого
- * `start`, из одностороннего `start` внутри блока). Это специально сделано
- * ОДНИМ местом в рантайме, а не размазано по кодогену: чтобы будущие
- * изменения компилятора не смогли снова "потерять" привязку для одного
- * из путей вызова, как это было раньше.
+/* Pins the CURRENT thread to physical core cpu_index (0-based numbering).
+ * A single entry point for codegen: called as the first instruction inside
+ * the body of a function declared with `cpu N`, regardless of how that
+ * function was invoked (directly from main, from the pthread wrapper of a
+ * top-level `start`, from a one-way `start` inside a block). This is
+ * deliberately kept as ONE place in the runtime rather than scattered
+ * across codegen, so that future compiler changes can't silently "lose"
+ * the pinning for one of the call paths again, as happened before.
  *
- * Проверяет cpu_index на валидность (0 <= cpu_index < число ядер по
- * sysconf(_SC_NPROCESSORS_ONLN) НА ЭТОЙ машине, в рантайме, а не на
- * машине, где шла компиляция) и проверяет реальный результат
- * pthread_setaffinity_np. Любая проблема — это rt_error (жёсткая
- * остановка с понятным сообщением), а не молчаливая работа "как получится". */
+ * Validates cpu_index (0 <= cpu_index < number of cores as reported by
+ * sysconf(_SC_NPROCESSORS_ONLN) on THIS machine, at runtime, not on the
+ * machine the compilation happened on) and checks the real result of
+ * pthread_setaffinity_np. Any problem is a hard rt_error (a hard stop
+ * with a clear message), not silent best-effort behavior. */
 void rt_pin_to_cpu(int line, int cpu_index);
 
-/* Проверка флага загрузки модуля/переменной перед использованием.
- * kind: "модуль" или "переменная", для текста сообщения. */
+/* Checks a module's/variable's "loaded" flag before use.
+ * kind: "module" or "variable", used in the message text. */
 void rt_require_loaded(int line, int loaded_flag, const char *name, const char *kind);
 
-/* Встроенные модули */
+/* Builtin modules */
 Value rt_display_show_text(Value v);
 Value rt_display_show_text_to(Value v, int to_stderr);
 Value rt_display_show_image(const char *resource_name);
 Value rt_math_count_equation(Value v);
 
-/* args — аргументы командной строки, с которыми запущен скомпилированный
- * бинарник (то, что раньше нигде не проверялось: сгенерированный main
- * был глухим main(void) и argv терялся полностью).
- * rt_args_init вызывается ОДИН РАЗ, самой первой инструкцией
- * сгенерированного main(argc, argv), — до пуска любых start-потоков.
- * Доступ к аргументам (как и к любому другому builtin-модулю) требует
- * '!export args*'; без него gen_call откажет ещё на этапе компиляции. */
+/* args — the command-line arguments the compiled binary was launched
+ * with (previously unchecked anywhere: the generated main used to be a
+ * deaf main(void) and argv was lost entirely).
+ * rt_args_init is called EXACTLY ONCE, as the very first instruction of
+ * the generated main(argc, argv), before any start-threads are launched.
+ * Accessing the arguments (like any other builtin module) requires
+ * '!export args*'; without it, gen_call already rejects it at compile time. */
 void  rt_args_init(int argc, char **argv);
-Value rt_args_count(void);           /* число аргументов, БЕЗ имени программы (argv[0]) */
-Value rt_args_get(int line, Value idx); /* idx — V_NUM, индекс с 0; вне диапазона — rt_error */
+Value rt_args_count(void);           /* number of arguments, WITHOUT the program name (argv[0]) */
+Value rt_args_get(int line, Value idx); /* idx — V_NUM, 0-based index; out of range — rt_error */
 
-/* input — чтение текста со стандартного ввода (stdin). Раньше в языке не
- * было вообще никакого способа что-то ввести — только считать и показать.
- * read.text()   — читает одну строку, без завершающего \n; на EOF — "".
- * read.number() — читает одну строку и парсит как число; невалидный
- *                  ввод — это rt_error (осознанно строго: программа не
- *                  должна молча продолжать со случайным числом). */
+/* input — reading text from standard input (stdin). The language used to
+ * have no way to read anything at all — only compute and display.
+ * read.text()   — reads a single line, without the trailing \n; on EOF — "".
+ * read.number() — reads a single line and parses it as a number; invalid
+ *                  input is an rt_error (deliberately strict: the program
+ *                  must not silently continue with a random number). */
 Value rt_input_read_text(void);
 Value rt_input_read_number(int line);
 
@@ -91,99 +91,101 @@ Value rt_file_write_text(int line, Value path, Value content);
 Value rt_file_append_text(int line, Value path, Value content);
 Value rt_file_exists(Value path);
 
-/* Буфер int(char=N) — единственный слот списка (см. N_REDIRECT в
- * компиляторе), используется, чтобы принять текстовый результат
- * builtin-вызова (например, command.execute.hidden) без предзнания
- * длины на этапе компиляции. capacity — то, сколько БАЙТ памяти было
- * выделено под объект при объявлении int(char=N) (N = байты, не
- * абстрактные "символы" — Unicode тут не отслеживается). Переполнение
- * — честная rt_error, никакого молчаливого усечения. */
+/* The int(char=N) buffer — the single "list slot" (see N_REDIRECT in
+ * the compiler), used to receive the text result of a builtin call
+ * (e.g. command.execute.hidden) without knowing its length at compile
+ * time. capacity is how many BYTES of memory were allocated for the
+ * object when int(char=N) was declared (N = bytes, not abstract
+ * "characters" — Unicode is not tracked here). Overflow is a proper
+ * rt_error, never a silent truncation. */
 void rt_buffer_store(int line, Value *slot, Value v, double capacity);
 
-/* Рантайм-проверка "это точно число", для редиректа '>' в float-переменную
- * из вызова, чей возвращаемый тип статически неизвестен (map.get,
- * file.read.text, command.execute.hidden, int8-переменные — значение
- * может оказаться и числом, и текстом). Компилятор пропускает такое
- * место компиляции (запретить его целиком означало бы отказаться от
- * вполне законных случаев вроде map.get, где программист точно знает,
- * что в этой карте лежат числа), но подстраховывает рантайм-проверкой:
- * если значение всё-таки оказалось текстом — честная rt_error с именем
- * целевой переменной, а не NaN/мусор в .num. */
+/* Runtime check "is this really a number", used for the '>' redirect
+ * into a float variable from a call whose return type is not known
+ * statically (map.get, file.read.text, command.execute.hidden, int8
+ * variables — the value could turn out to be either a number or text).
+ * The compiler lets this case through (forbidding it outright would
+ * mean giving up on perfectly legitimate cases like map.get, where the
+ * programmer knows for a fact that this map holds numbers), but backs
+ * it up with a runtime check: if the value does turn out to be text,
+ * that's a proper rt_error naming the target variable, not NaN/garbage in .num. */
 Value rt_require_number(int line, Value v, const char *target_name);
 
-/* command — запуск внешних команд через указанный шелл.
- * execute.show()   — обычный запуск, наследует stdin/stdout/stderr
- *                     текущего терминала (как если бы её запустили
- *                     вручную в том же самом эмуляторе терминала).
- *                     Возвращает код завершения (float).
- * execute.hidden()  — тот же запуск, но полностью тихий: собственный
- *                     stdin процесса — /dev/null, stderr — /dev/null,
- *                     а stdout перехватывается и возвращается строкой
- *                     (обычно сразу через редирект `>` в буфер
- *                     int(char=N)). Ничего не просачивается в реальный
- *                     терминал пользователя. */
+/* command — running external commands through the given shell.
+ * execute.show()   — a normal run, inherits stdin/stdout/stderr from
+ *                     the current terminal (as if it had been run by
+ *                     hand in the same terminal emulator).
+ *                     Returns the exit code (float).
+ * execute.hidden()  — the same run, but completely silent: the
+ *                     process's own stdin is /dev/null, stderr is
+ *                     /dev/null, and stdout is captured and returned
+ *                     as a string (usually straight through the `>`
+ *                     redirect into an int(char=N) buffer). Nothing
+ *                     leaks into the user's real terminal. */
 Value rt_command_execute_show(int line, Value shell, Value command);
 Value rt_command_execute_hidden(int line, Value shell, Value command);
 
-/* sleep — единственный на сегодня примитив уступки CPU в языке (SPEC:
- * до этого loop repeat N компилировался в голый for без единой паузы,
- * что при параллельных start-потоках позволяло тривиально забить все
- * ядра машины под 100%). sleep.ms(N) — блокирующая пауза текущего
- * потока на N миллисекунд (float, >= 0). Отрицательное N — rt_error,
- * не молчаливая работа "как получится". */
+/* sleep — currently the language's only primitive for yielding the CPU
+ * (per SPEC: before this, loop repeat N compiled to a bare for loop
+ * with no pause at all, which with parallel start-threads made it
+ * trivial to pin every core on the machine at 100%). sleep.ms(N) —
+ * blocks the current thread for N milliseconds (float, >= 0). A
+ * negative N is an rt_error, not silent best-effort behavior. */
 Value rt_sleep_ms(int line, Value ms);
 
-/* map — именованная хэш-таблица (ключ -> значение), ключ и значение —
- * число или текст (не список). "Именованная" означает, что сама
- * таблица не привязана к какой-то отдельной переменной STPL (в языке
- * пока нет первоклассного типа "хэш-таблица") — она живёт в рантайме
- * под строковым именем, которое передаётся первым аргументом в каждый
- * вызов; первый же map.set(...) с новым именем создаёт таблицу.
- * set()    — записывает/перезаписывает пару ключ-значение, не падает.
- * get()    — возвращает значение по ключу; ключа нет (в том числе
- *             если такой таблицы вообще не было) — честная rt_error,
- *             как и everywhere else в языке (никакого молчаливого nil).
- * has()    — 1/0, есть ли ключ; никогда не падает (как file.exists).
- * delete()  — удаляет пару, если она есть; если её и не было — тихо
- *             ничего не делает (идемпотентно, как обычный rm -f).
- * count()  — число пар в таблице; 0, если такой таблицы ещё не было;
- *             никогда не падает. */
+/* map — a named hash table (key -> value); the key and value are
+ * either a number or text (not a list). "Named" means the table
+ * itself isn't tied to any particular STPL variable (the language
+ * has no first-class "hash table" type yet) — it lives in the runtime
+ * under a string name, which is passed as the first argument to every
+ * call; the very first map.set(...) with a new name creates the table.
+ * set()    — writes/overwrites a key-value pair, never fails.
+ * get()    — returns the value for a key; if the key doesn't exist
+ *             (including if the table never existed at all) — a
+ *             proper rt_error, same as everywhere else in the
+ *             language (never a silent nil).
+ * has()    — 1/0, whether the key exists; never fails (like file.exists).
+ * delete()  — removes the pair if it exists; if it didn't exist, quietly
+ *             does nothing (idempotent, like a plain rm -f).
+ * count()  — number of pairs in the table; 0 if it never existed; never fails. */
 Value rt_map_set(int line, Value map_name, Value key, Value value);
 Value rt_map_get(int line, Value map_name, Value key);
 Value rt_map_has(Value map_name, Value key);
 Value rt_map_delete(Value map_name, Value key);
 Value rt_map_count(Value map_name);
 
-/* str — базовые операции над строками как данными (не над файлами
- * и не над списками-литералами int(char=N)). Всё принимает Value
- * "как есть" (число автоматически превращается в свою десятичную
- * запись через v_as_cstr — та же логика, что уже везде в рантайме).
- * length()  — длина в байтах (не в "символах" Unicode — см. общее
- *             уточнение про char=N: язык считает байты).
- * char_at() — однобайтовая подстрока по 0-based индексу; индекс вне
- *             диапазона — честная rt_error с длиной строки в сообщении.
- * concat()  — конкатенация двух значений в новую строку.
- * substr()  — подстрока [start, start+len); диапазон вне границ —
- *             честная rt_error, а не молчаливое усечение. */
+/* str — basic operations on strings as data (not on files, and not on
+ * int(char=N) list literals). Everything accepts a Value "as is" (a
+ * number is automatically turned into its decimal representation via
+ * v_as_cstr — the same logic used everywhere else in the runtime).
+ * length()  — length in bytes (not in Unicode "characters" — see the
+ *             general note on char=N: the language counts bytes).
+ * char_at() — a one-byte substring at a 0-based index; an out-of-range
+ *             index is a proper rt_error that includes the string's length.
+ * concat()  — concatenates two values into a new string.
+ * substr()  — the substring [start, start+len); an out-of-range range
+ *             is a proper rt_error, never a silent truncation. */
 Value rt_str_length(Value s);
 Value rt_str_char_at(int line, Value s, Value idx);
 Value rt_str_concat(Value a, Value b);
 Value rt_str_substr(int line, Value s, Value start, Value len);
 
-/* sync — именованные мьютексы (pthread_mutex_t) для защиты общих
- * ресурсов между параллельными `start`-задачами. Как и `map`, мьютекс
- * не привязан к переменной STPL — он живёт в рантайме под строковым
- * именем; первый же sync.lock(...) с новым именем создаёт мьютекс.
- * lock()/unlock() — тонкие обёртки над pthread_mutex_lock/unlock;
- * ошибка pthread (например, unlock чужого потока) — честная rt_error,
- * не молчаливое игнорирование. Эта функция не решает проблему гонок
- * данных сама по себе — она даёт программисту инструмент, которым
- * можно её решить руками (как и everywhere else в языке: язык не
- * скрывает опасность, а даёт явный, предсказуемый примитив). */
+/* sync — named mutexes (pthread_mutex_t) for protecting shared
+ * resources between parallel `start` tasks. Like `map`, a mutex isn't
+ * tied to an STPL variable — it lives in the runtime under a string
+ * name; the very first sync.lock(...) with a new name creates the mutex.
+ * lock()/unlock() — thin wrappers over pthread_mutex_lock/unlock; a
+ * pthread error (e.g. unlocking another thread's lock) is a proper
+ * rt_error, never silently ignored. This function does not solve data
+ * races by itself — it gives the programmer a tool to solve them by
+ * hand (same as everywhere else in the language: the language doesn't
+ * hide the danger, it gives an explicit, predictable primitive). */
 Value rt_sync_lock(int line, Value name);
 Value rt_sync_unlock(int line, Value name);
 
-/* Ресурсы, встроенные в хвост бинарника (см. rt_embed.c / формат footer'а). */
+/* Resources embedded in the tail of the binary (see rt_embed.c / the footer format). */
 const unsigned char *rt_resource_load(const char *name, size_t *out_len);
+Value rt_resource_load_text(int line, const char *name);
+Value rt_resource_extract(int line, const char *name);
 
 #endif
